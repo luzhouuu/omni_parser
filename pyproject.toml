@@ -1,0 +1,90 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "browser-agent"
+version = "0.1.0"
+description = "Visual Browser Automation Agent using OmniParser + GPT + Playwright"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Browser Agent Team"}
+]
+keywords = [
+    "browser-automation",
+    "playwright",
+    "omniparser",
+    "gpt",
+    "langgraph",
+    "web-agent",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Internet :: WWW/HTTP :: Browsers",
+]
+
+dependencies = [
+    "langgraph>=0.5.3",
+    "langchain-core>=0.3.68",
+    "langchain-openai>=0.3.28",
+    "playwright>=1.49.0",
+    "torch>=2.0.0",
+    "ultralytics>=8.3.0",
+    "transformers>=4.45.0",
+    "safetensors>=0.4.0",
+    "Pillow>=10.0.0",
+    "numpy>=1.24.0",
+    "opencv-python>=4.8.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.1.1",
+    "loguru>=0.7.2",
+    "aiofiles>=24.1.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+    "black>=24.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/browser-agent"
+Documentation = "https://github.com/example/browser-agent#readme"
+Repository = "https://github.com/example/browser-agent"
+
+[project.scripts]
+browser-agent = "browser_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+browser_agent = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
