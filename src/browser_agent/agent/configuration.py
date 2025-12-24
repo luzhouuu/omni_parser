@@ -6,8 +6,8 @@ from typing import Optional
 
 from dotenv import load_dotenv, find_dotenv
 
-# Load .env file
-load_dotenv(find_dotenv())
+# Load .env file (override=True to ensure .env values take precedence over system env vars)
+load_dotenv(find_dotenv(), override=True)
 
 
 def _env_or_default(name: str, default: str) -> str:
@@ -25,6 +25,7 @@ LLM_TYPE = os.getenv("LLM_TYPE", "azure_openai")
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 LLM_API_VERSION = os.getenv("LLM_API_VERSION", "2025-01-01-preview")
 LLM_MODEL_NAME = _env_or_default("LLM_MODEL_NAME", "gpt-4o")
 

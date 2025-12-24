@@ -113,6 +113,18 @@ async def plan_node(state: BrowserAgentState) -> Dict[str, Any]:
     """
     logger.info(f"[Step {state.get('current_step', 0)}] Planning next action...")
 
+    # Check if login is required - bypass LLM and handle directly
+    if state.get("login_required"):
+        logger.info("Login required detected - generating handle_login action")
+        return {
+            "next_action": {
+                "action_type": "handle_login",
+            },
+            "current_plan": "Automatically handling login popup",
+            "should_retry": False,
+            "retry_count": 0,
+        }
+
     config = state.get("config", {})
 
     # Create LLM client with tools

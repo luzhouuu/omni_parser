@@ -89,6 +89,10 @@ class BrowserAgentState(TypedDict, total=False):
     retry_count: int
     """Number of retries for the current action."""
 
+    # Login handling
+    login_required: bool
+    """Whether login popup was detected and login is needed."""
+
     # Error handling
     error: Optional[str]
     """Current error message, if any."""
@@ -166,6 +170,8 @@ def create_initial_state(
         is_complete=False,
         should_retry=False,
         retry_count=0,
+        # Login handling
+        login_required=False,
         # Error handling
         error=None,
         error_history=[],

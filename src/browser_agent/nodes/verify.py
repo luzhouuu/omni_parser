@@ -10,6 +10,95 @@ from browser_agent.utils.log_utils import get_logger
 logger = get_logger(__name__)
 
 
+async def detect_login_popup(browser) -> bool:
+    """Detect if a login popup or login page is displayed.
+
+    Args:
+        browser: BrowserController instance
+
+    Returns:
+        True if login popup/page detected, False otherwise
+    """
+    if not browser or not browser.page:
+        return False
+
+    page = browser.page
+
+    # First check URL for login page patterns
+    try:
+        current_url = page.url.lower()
+        login_url_patterns = [
+            "login",
+            "logon",
+            "signin",
+            "sign-in",
+            "authenticate",
+            "account/log",
+        ]
+        for pattern in login_url_patterns:
+            if pattern in current_url:
+                logger.info(f"Login page detected via URL pattern: {pattern} in {current_url}")
+                return True
+    except Exception:
+        pass
+
+    # Login popup detection selectors
+    login_indicators = [
+        "input[type='password']",  # Password input field
+        ".login-modal",
+        ".login-dialog",
+        ".login-popup",
+        "#loginModal",
+        "[class*='login'][class*='modal']",
+        "[class*='login'][class*='dialog']",
+    ]
+
+    try:
+        for selector in login_indicators:
+            try:
+                element = await page.query_selector(selector)
+                if element:
+                    is_visible = await element.is_visible()
+                    if is_visible:
+                        logger.info(f"Login detected via selector: {selector}")
+                        return True
+            except Exception:
+                continue
+
+        # Also check for login-related text in visible elements
+        login_text_check = await page.evaluate("""
+            () => {
+                const body = document.body;
+                if (!body) return false;
+
+                // Look for visible login form elements
+                const forms = document.querySelectorAll('form');
+                for (const form of forms) {
+                    const formText = form.innerText || '';
+                    const hasPassword = form.querySelector('input[type="password"]');
+                    const hasLoginText = formText.includes('登录') || formText.includes('Login') || formText.includes('Sign in');
+                    if (hasPassword && hasLoginText) {
+                        // Check if form is visible
+                        const rect = form.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+        """)
+
+        if login_text_check:
+            logger.info("Login detected via form analysis")
+            return True
+
+    except Exception as e:
+        logger.debug(f"Error detecting login: {e}")
+
+    return False
+
+
 class ActionVerifier:
     """Multi-strategy action verification."""
 
@@ -246,6 +335,27 @@ async def verify_node(state: BrowserAgentState) -> Dict[str, Any]:
     # Skip verification if already complete
     if state.get("is_complete"):
         return {}
+
+    # Check for login popup
+    browser = state.get("_browser_controller")
+    if browser:
+        login_detected = await detect_login_popup(browser)
+        if login_detected:
+            # Get current URL (contains ReturnUrl parameter for redirect after login)
+            current_login_url = browser.page.url if browser.page else ""
+            logger.warning(f"Login popup detected! Setting login_required=True, URL: {current_login_url[:80]}...")
+            return {
+                "login_required": True,
+                "current_url": current_login_url,  # Save URL for ReturnUrl extraction
+                "verification_result": {
+                    "success": False,
+                    "level": "login_required",
+                    "confidence": 0.95,
+                    "details": "Login popup detected - need to authenticate",
+                    "should_retry": False,
+                    "stuck_detection": False,
+                },
+            }
 
     action_history = state.get("action_history", [])
     if not action_history:

@@ -9,15 +9,13 @@ from browser_agent.agent.configuration import (
     AZURE_OPENAI_ENDPOINT,
     AZURE_OPENAI_API_KEY,
     OPENAI_API_KEY,
+    GOOGLE_API_KEY,
     LLM_API_VERSION,
     LLM_MODEL_NAME,
 )
 from browser_agent.utils.log_utils import get_logger
 
 logger = get_logger(__name__)
-
-# Gemini API Key from environment
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 
 def create_llm_client(

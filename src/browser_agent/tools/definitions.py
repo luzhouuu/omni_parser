@@ -149,6 +149,11 @@ class ClickAllMatchingInput(BaseModel):
     )
 
 
+class HandleLoginInput(BaseModel):
+    """Input schema for handle_login tool."""
+    pass  # No parameters needed - credentials come from environment variables
+
+
 class DoneInput(BaseModel):
     """Input schema for done tool."""
     success: bool = Field(
@@ -384,6 +389,27 @@ def click_all_matching_tool(
     return f"Click all elements matching '{text_pattern}'"
 
 
+@tool("handle_login", args_schema=HandleLoginInput)
+def handle_login_tool() -> str:
+    """Handle login popup automatically using pre-configured credentials.
+
+    Use this tool when a login popup or login form appears on the page.
+    This typically happens when trying to access protected content (like downloads).
+
+    The tool will:
+    1. Close the current browser session
+    2. Execute the login script with credentials from environment variables
+    3. Restart the browser and return to the original page
+
+    IMPORTANT: Use this when you see a login form with password input field.
+    The credentials are configured via WANFANG_USERNAME and WANFANG_PASSWORD environment variables.
+
+    Returns:
+        Result message indicating login status
+    """
+    return "Handle login using stored credentials"
+
+
 @tool("done", args_schema=DoneInput)
 def done_tool(success: bool, message: str) -> str:
     """Signal that the task is complete.
@@ -422,6 +448,7 @@ def get_all_tools() -> List:
         download_tool,
         screenshot_tool,
         click_all_matching_tool,
+        handle_login_tool,
         done_tool,
     ]
 
