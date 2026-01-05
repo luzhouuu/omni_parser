@@ -286,8 +286,6 @@ asyncio.run(main())
 # 使用真实解析器
 python scripts/run_demo.py --url "https://lczl.med.wanfangdata.com.cn/ADR?pagesize=1" --goal "点击所有下载全文按钮"
 
-python scripts/wanfang_login.py --username "18696799103" --password "Acmilan@2025" 
-
 # 使用模拟解析器（测试用）
 python scripts/run_demo.py --mock
 ```

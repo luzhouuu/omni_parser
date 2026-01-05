@@ -68,3 +68,6 @@ downloads/
 
 # Browser persistent data
 .browser_data/
+
+# Data files (papers, CSV history)
+data/

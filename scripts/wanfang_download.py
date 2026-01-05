@@ -10,10 +10,14 @@ based on a pending CSV file. For each paper:
 5. Update pending CSV and download history
 
 Usage:
-    python scripts/wanfang_download.py --csv data/pending_download_20251225_125945.csv
+    # Default: reads from data/pending_download.csv
+    python scripts/wanfang_download.py
 
     # With options:
-    python scripts/wanfang_download.py --csv data/pending.csv --max-papers 10 --delay 3
+    python scripts/wanfang_download.py --max-papers 10 --delay 3
+
+    # Specify custom CSV:
+    python scripts/wanfang_download.py --csv data/custom.csv
 """
 
 import argparse
@@ -42,6 +46,7 @@ LOGIN_URL = "https://login.med.wanfangdata.com.cn/Account/LogOn"
 DEFAULT_USER_DATA_DIR = str(Path(__file__).parent.parent / ".browser_data")
 DATA_DIR = Path(__file__).parent.parent / "data"
 PAPERS_DIR = DATA_DIR / "papers"
+PENDING_CSV = DATA_DIR / "pending_download.csv"
 HISTORY_CSV = DATA_DIR / "downloaded_history.csv"
 FAILED_CSV = DATA_DIR / "download_failed.csv"
 
@@ -151,6 +156,47 @@ def append_to_failed(paper: dict, reason: str):
         writer.writerow(paper_copy)
 
 
+async def wait_for_manual_login(page, timeout: int = 300) -> bool:
+    """Wait for user to manually login in the browser.
+
+    Args:
+        page: Playwright page object
+        timeout: Maximum wait time in seconds (default 5 minutes)
+
+    Returns:
+        True if login detected, False if timeout
+    """
+    import sys
+    import select
+
+    print(f"   (Timeout: {timeout}s)")
+
+    start_time = asyncio.get_event_loop().time()
+    while True:
+        # Check if user pressed Enter
+        if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+            sys.stdin.readline()
+            print("   Continuing...")
+            return True
+
+        # Check login status periodically
+        try:
+            is_logged_in = await check_login_status(page)
+            if is_logged_in:
+                print("   ✅ Login detected!")
+                return True
+        except Exception:
+            pass
+
+        # Check timeout
+        elapsed = asyncio.get_event_loop().time() - start_time
+        if elapsed > timeout:
+            print("   ⏰ Timeout waiting for login")
+            return False
+
+        await asyncio.sleep(2)
+
+
 async def check_login_status(page) -> bool:
     """Check if user is logged in.
 
@@ -165,19 +211,33 @@ async def check_login_status(page) -> bool:
         result = await page.evaluate("""
             () => {
                 // Look for logout button or user info as sign of being logged in
-                const logoutBtn = document.querySelector('a[href*="LogOff"], .logout, .user-info, .username');
-                if (logoutBtn) return true;
+                const logoutBtn = document.querySelector('a[href*="LogOff"], .logout, .user-info, .username, .user-name');
+                if (logoutBtn) return {loggedIn: true, reason: 'found_logout'};
 
-                // Check if login link is visible (means not logged in)
-                const loginLink = document.querySelector('a[href*="LogOn"], .login-btn');
-                if (loginLink) return false;
+                // Check page content for user-related text
+                const bodyText = document.body.innerText;
+                if (bodyText.includes('退出') || bodyText.includes('我的') || bodyText.includes('账户')) {
+                    return {loggedIn: true, reason: 'found_user_text'};
+                }
+
+                // Check if login link is prominently visible (means not logged in)
+                const loginLink = document.querySelector('a[href*="LogOn"], .login-btn, .btn-login');
+                if (loginLink) {
+                    // Check if the login link is visible
+                    const rect = loginLink.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        return {loggedIn: false, reason: 'found_login_link'};
+                    }
+                }
 
                 // Default to assuming logged in if no clear indicator
-                return true;
+                return {loggedIn: true, reason: 'no_clear_indicator'};
             }
         """)
-        return result
-    except Exception:
+        logger.info(f"Login status check: {result}")
+        return result.get('loggedIn', True)
+    except Exception as e:
+        logger.warning(f"Login check failed: {e}, assuming logged in")
         return True
 
 
@@ -229,35 +289,129 @@ async def perform_login(browser: BrowserController, username: str, password: str
 
     # Solve slider captcha
     print("   Solving captcha...")
-    await solve_slider_captcha(browser)
-    await asyncio.sleep(1)
+    captcha_solved = await solve_slider_captcha(browser)
+    print(f"   Captcha solved: {captcha_solved}")
 
-    # Click login
+    # Wait for captcha verification to complete
+    await asyncio.sleep(2)
+
+    # Click login button with multiple attempts
     print("   Clicking login button...")
-    await page.evaluate("""
+
+    # First, try to find the button and get its info
+    btn_info = await page.evaluate("""
         () => {
-            const buttons = document.querySelectorAll('button, input[type="submit"]');
-            for (const btn of buttons) {
-                const text = btn.textContent || btn.value || '';
-                if (text.includes('登录') || text.includes('登 录')) {
-                    btn.click();
-                    return true;
+            // Look for login button with multiple selectors
+            const selectors = [
+                'button.login-btn',
+                'button.btn-login',
+                'input[type="submit"]',
+                'button[type="submit"]',
+                '.login-form button',
+                'form button',
+                'button',
+            ];
+
+            for (const selector of selectors) {
+                const buttons = document.querySelectorAll(selector);
+                for (const btn of buttons) {
+                    const text = (btn.textContent || btn.value || '').trim();
+                    if (text.includes('登录') || text.includes('登 录') || text === '登录') {
+                        const rect = btn.getBoundingClientRect();
+                        return {
+                            found: true,
+                            text: text,
+                            x: rect.x + rect.width / 2,
+                            y: rect.y + rect.height / 2,
+                            width: rect.width,
+                            height: rect.height,
+                            disabled: btn.disabled,
+                            selector: selector,
+                        };
+                    }
                 }
             }
-            return false;
+            return {found: false};
         }
     """)
 
-    await asyncio.sleep(2)
+    print(f"   Button info: {btn_info}")
 
-    # Check if login succeeded
-    current_url = page.url
-    if "LogOn" not in current_url and "login" not in current_url.lower():
-        print("   Login successful!")
-        return True
+    if btn_info.get('found'):
+        # Wait if button is disabled
+        if btn_info.get('disabled'):
+            print("   Button is disabled, waiting...")
+            await asyncio.sleep(2)
+
+        # Click using mouse coordinates (more reliable)
+        x = btn_info.get('x', 0)
+        y = btn_info.get('y', 0)
+        if x > 0 and y > 0:
+            print(f"   Clicking at ({x}, {y})...")
+            await page.mouse.click(x, y)
+            await asyncio.sleep(0.5)
+
+            # Also try JavaScript click as backup
+            await page.evaluate("""
+                () => {
+                    const buttons = document.querySelectorAll('button, input[type="submit"]');
+                    for (const btn of buttons) {
+                        const text = (btn.textContent || btn.value || '').trim();
+                        if (text.includes('登录') || text.includes('登 录') || text === '登录') {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            """)
     else:
-        print("   Login may have failed")
-        return False
+        print("   Warning: Login button not found!")
+        # Try clicking by text using Playwright locator
+        try:
+            login_btn = page.locator('button:has-text("登录"), input[value*="登录"]').first
+            if await login_btn.count() > 0:
+                print("   Found button via Playwright locator, clicking...")
+                await login_btn.click()
+        except Exception as e:
+            print(f"   Failed to click via locator: {e}")
+
+    # Wait for page navigation after login
+    print("   Waiting for login redirect...")
+
+    # Try multiple times to detect successful login
+    for attempt in range(10):  # Try for up to 30 seconds
+        await asyncio.sleep(3)
+        current_url = page.url
+
+        # Check if we've left the login page
+        if "LogOn" not in current_url and "login" not in current_url.lower():
+            print(f"   ✅ Login successful! Redirected to: {current_url[:50]}...")
+            # Extra wait to let page fully load
+            await asyncio.sleep(2)
+            return True
+
+        # Check if still on login page - maybe need to re-solve captcha or re-click
+        if attempt == 3:
+            print("   Still on login page, checking for errors...")
+            error_text = await page.evaluate("""
+                () => {
+                    const errors = document.querySelectorAll('.error, .alert, [class*="error"], [class*="alert"]');
+                    for (const err of errors) {
+                        if (err.textContent && err.textContent.trim()) {
+                            return err.textContent.trim();
+                        }
+                    }
+                    return null;
+                }
+            """)
+            if error_text:
+                print(f"   Found error: {error_text}")
+
+        print(f"   Attempt {attempt + 1}/10: Still on login page...")
+
+    print("   Login may have failed after waiting")
+    return False
 
 
 async def solve_slider_captcha(browser: BrowserController) -> bool:
@@ -343,7 +497,7 @@ async def solve_slider_captcha(browser: BrowserController) -> bool:
 
 
 async def search_paper_by_title(browser: BrowserController, title: str) -> bool:
-    """Search for a paper by its title.
+    """Search for a paper by its title using URL.
 
     Args:
         browser: BrowserController instance
@@ -352,99 +506,16 @@ async def search_paper_by_title(browser: BrowserController, title: str) -> bool:
     Returns:
         True if search results found
     """
+    from urllib.parse import quote
+
     page = browser.page
 
-    # Navigate to search page
-    await browser.navigate(SEARCH_URL)
-    await asyncio.sleep(2)
+    # Build search URL directly
+    search_query = f"题名={title}"
+    search_url = f"https://med.wanfangdata.com.cn/Paper/Search?q={quote(search_query)}"
 
-    # Select 题名 search type
-    print("      Selecting title search mode...")
-    await page.evaluate("""
-        () => {
-            // Look for dropdown or select that controls search type
-            const selects = document.querySelectorAll('select, .dropdown, [role="listbox"]');
-            for (const sel of selects) {
-                const options = sel.querySelectorAll('option');
-                for (const opt of options) {
-                    if (opt.textContent.includes('题名')) {
-                        sel.value = opt.value;
-                        sel.dispatchEvent(new Event('change', { bubbles: true }));
-                        return true;
-                    }
-                }
-            }
-
-            // Try clicking a dropdown and selecting 题名
-            const dropdownTriggers = document.querySelectorAll('[class*="dropdown"], [class*="select"]');
-            for (const trigger of dropdownTriggers) {
-                trigger.click();
-            }
-            return false;
-        }
-    """)
-    await asyncio.sleep(0.5)
-
-    # Try to click 题名 option if dropdown is visible
-    try:
-        title_option = page.locator('text=题名').first
-        if await title_option.count() > 0:
-            await title_option.click()
-            await asyncio.sleep(0.5)
-    except Exception:
-        pass
-
-    # Enter search query
-    print("      Entering search query...")
-    search_input_found = await page.evaluate("""
-        (title) => {
-            const inputs = document.querySelectorAll('input[type="text"], textarea');
-            for (const input of inputs) {
-                const placeholder = input.placeholder || '';
-                const className = input.className || '';
-                if (placeholder.includes('检索') || placeholder.includes('搜索') ||
-                    className.includes('search') || input.offsetWidth > 200) {
-                    input.focus();
-                    input.value = title;
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                    return true;
-                }
-            }
-            // Try first visible text input
-            for (const input of inputs) {
-                if (input.offsetWidth > 0 && input.offsetHeight > 0) {
-                    input.focus();
-                    input.value = title;
-                    input.dispatchEvent(new Event('input', { bubbles: true }));
-                    return true;
-                }
-            }
-            return false;
-        }
-    """, title)
-
-    if not search_input_found:
-        logger.warning("Could not find search input")
-        return False
-
-    await asyncio.sleep(0.5)
-
-    # Click search button
-    print("      Clicking search button...")
-    await page.evaluate("""
-        () => {
-            const buttons = document.querySelectorAll('button, input[type="submit"], a');
-            for (const btn of buttons) {
-                const text = btn.textContent || btn.value || '';
-                if (text.includes('检索') || text.includes('搜索')) {
-                    btn.click();
-                    return true;
-                }
-            }
-            return false;
-        }
-    """)
-
+    print(f"      Navigating to search URL...")
+    await browser.navigate(search_url)
     await asyncio.sleep(3)
 
     # Handle captcha if present
@@ -456,6 +527,17 @@ async def search_paper_by_title(browser: BrowserController, title: str) -> bool:
     # Check if results were found
     results_count = await page.evaluate("""
         () => {
+            // Check for "下载全文" buttons by text content
+            const links = document.querySelectorAll('a');
+            let downloadCount = 0;
+            for (const link of links) {
+                const text = link.textContent || '';
+                if (text.includes('下载全文') || text.includes('全文下载')) {
+                    downloadCount++;
+                }
+            }
+            if (downloadCount > 0) return downloadCount;
+
             // Check for result items
             const results = document.querySelectorAll('.paper-item, .result-item, [class*="paper"], [class*="result"]');
             if (results.length > 0) return results.length;
@@ -467,8 +549,8 @@ async def search_paper_by_title(browser: BrowserController, title: str) -> bool:
             }
 
             // Check for article links
-            const links = document.querySelectorAll('a[href*="Paper/Detail"], a[href*="paper/"]');
-            return links.length;
+            const links2 = document.querySelectorAll('a[href*="Paper/Detail"], a[href*="paper/"]');
+            return links2.length;
         }
     """)
 
@@ -503,73 +585,104 @@ async def check_for_captcha(page) -> bool:
         return False
 
 
-async def click_first_result(browser: BrowserController) -> bool:
-    """Click the first search result.
+async def check_for_login_popup(page) -> bool:
+    """Check if a login popup or redirect to login page occurred."""
+    try:
+        # Check URL for login redirect
+        current_url = page.url
+        if "LogOn" in current_url or "login" in current_url.lower():
+            return True
 
-    Args:
-        browser: BrowserController instance
+        # Check for login modal/popup
+        result = await page.evaluate("""
+            () => {
+                // Check for login modal
+                const modal = document.querySelector('.login-modal, .modal-login, [class*="login-dialog"]');
+                if (modal && modal.offsetParent !== null) return true;
 
-    Returns:
-        True if clicked successfully
-    """
+                // Check for login form in popup
+                const loginForm = document.querySelector('form[action*="login"], form[action*="LogOn"]');
+                if (loginForm && loginForm.offsetParent !== null) return true;
+
+                // Check for iframe with login
+                const iframe = document.querySelector('iframe[src*="login"], iframe[src*="LogOn"]');
+                if (iframe) return true;
+
+                return false;
+            }
+        """)
+        return result
+    except Exception:
+        return False
+
+
+async def handle_login_popup(browser: BrowserController, username: str, password: str) -> bool:
+    """Handle login popup by performing login."""
     page = browser.page
 
-    print("      Clicking first result...")
+    try:
+        # If redirected to login page, perform full login
+        if "LogOn" in page.url or "login" in page.url.lower():
+            return await perform_login(browser, username, password)
 
-    # Try to click the first result link
-    clicked = await page.evaluate("""
-        () => {
-            // Try specific paper detail links
-            const detailLinks = document.querySelectorAll('a[href*="Paper/Detail"], a[href*="/Paper/"]');
-            if (detailLinks.length > 0) {
-                detailLinks[0].click();
-                return true;
+        # Try to find and fill login form in popup
+        await page.evaluate("""
+            () => {
+                const userInput = document.querySelector('input[placeholder*="用户名"], input[placeholder*="手机号"], input[name="userName"]');
+                if (userInput) userInput.focus();
             }
+        """)
+        await asyncio.sleep(0.3)
+        await browser.type_text(username, delay=30)
 
-            // Try result title links
-            const titleLinks = document.querySelectorAll('.paper-title a, .result-title a, h3 a, h4 a');
-            if (titleLinks.length > 0) {
-                titleLinks[0].click();
-                return true;
+        await page.evaluate("""
+            () => {
+                const passInput = document.querySelector('input[type="password"]');
+                if (passInput) passInput.focus();
             }
+        """)
+        await asyncio.sleep(0.3)
+        await browser.type_text(password, delay=30)
 
-            // Try any link in result container
-            const resultItems = document.querySelectorAll('.paper-item, .result-item, [class*="result"]');
-            if (resultItems.length > 0) {
-                const link = resultItems[0].querySelector('a');
-                if (link) {
-                    link.click();
-                    return true;
+        # Try to solve captcha if present
+        await solve_slider_captcha(browser)
+        await asyncio.sleep(0.5)
+
+        # Click login button
+        await page.evaluate("""
+            () => {
+                const buttons = document.querySelectorAll('button, input[type="submit"]');
+                for (const btn of buttons) {
+                    const text = btn.textContent || btn.value || '';
+                    if (text.includes('登录') || text.includes('登 录')) {
+                        btn.click();
+                        return true;
+                    }
                 }
+                return false;
             }
-
-            return false;
-        }
-    """)
-
-    if clicked:
-        await asyncio.sleep(3)  # Wait for detail page to load
+        """)
+        await asyncio.sleep(2)
         return True
 
-    # Fallback: try Playwright locator
-    try:
-        result_link = page.locator('a[href*="Paper"]').first
-        if await result_link.count() > 0:
-            await result_link.click()
-            await asyncio.sleep(3)
-            return True
-    except Exception:
-        pass
-
-    return False
+    except Exception as e:
+        logger.warning(f"Handle login popup failed: {e}")
+        return False
 
 
-async def download_paper(browser: BrowserController, paper_title: str) -> str:
-    """Download the paper PDF from the detail page.
+async def download_paper_from_search(
+    browser: BrowserController,
+    paper_title: str,
+    username: str = "",
+    password: str = "",
+) -> str:
+    """Download the paper PDF directly from search results page.
 
     Args:
         browser: BrowserController instance
         paper_title: Paper title for naming the file
+        username: Wanfang username for re-login if needed
+        password: Wanfang password for re-login if needed
 
     Returns:
         Path to downloaded file, or empty string if failed
@@ -579,80 +692,88 @@ async def download_paper(browser: BrowserController, paper_title: str) -> str:
     # Ensure papers directory exists
     PAPERS_DIR.mkdir(parents=True, exist_ok=True)
 
-    print("      Looking for download button...")
+    print("      Looking for '下载全文' button...")
 
-    # Try to find and click download button
-    download_selectors = [
-        'a:has-text("下载")',
-        'a:has-text("PDF")',
-        'button:has-text("下载")',
-        '.download-btn',
-        '[class*="download"]',
-        'a[href*="download"]',
-    ]
+    # Prepare filename
+    safe_title = sanitize_filename(paper_title)
+    filename = f"{safe_title}.pdf"
 
-    for selector in download_selectors:
-        try:
-            elem = page.locator(selector).first
-            if await elem.count() > 0:
-                # Check if it's a PDF download link
-                href = await elem.get_attribute('href') or ''
-                text = await elem.text_content() or ''
+    # Try to find "下载全文" button in search results (first result)
+    try:
+        # Look for the first "下载全文" link (Playwright selector syntax)
+        download_btn = page.locator('a:has-text("下载全文")').first
+        if await download_btn.count() > 0:
+            print("      Found '下载全文' button, clicking...")
 
-                if 'pdf' in href.lower() or 'download' in href.lower() or '下载' in text:
-                    print(f"      Found download button: {selector}")
+            try:
+                async def click_download():
+                    await download_btn.click()
 
-                    # Prepare filename
-                    safe_title = sanitize_filename(paper_title)
-                    filename = f"{safe_title}.pdf"
+                file_path = await browser.handle_download(
+                    click_download,
+                    save_as=filename
+                )
 
-                    try:
-                        async def click_download():
-                            await elem.click()
+                # Move to papers directory
+                final_path = PAPERS_DIR / filename
+                if Path(file_path).exists():
+                    import shutil
+                    shutil.move(file_path, final_path)
+                    print(f"      Downloaded: {final_path}")
+                    return str(final_path)
 
-                        file_path = await browser.handle_download(
-                            click_download,
-                            save_as=filename
-                        )
+            except Exception as e:
+                logger.warning(f"Download via button failed: {e}")
+                # Check if login popup appeared
+                await asyncio.sleep(1)
+                if await check_for_login_popup(page):
+                    print("      Login popup detected, re-authenticating...")
+                    if username and password:
+                        await handle_login_popup(browser, username, password)
+                        # Retry download
+                        return await download_paper_from_search(browser, paper_title, "", "")
 
-                        # Move to papers directory
-                        final_path = PAPERS_DIR / filename
-                        if Path(file_path).exists():
-                            import shutil
-                            shutil.move(file_path, final_path)
-                            print(f"      Downloaded: {final_path}")
-                            return str(final_path)
-
-                    except Exception as e:
-                        logger.warning(f"Download failed: {e}")
-                        continue
-
-        except Exception as e:
-            logger.debug(f"Selector {selector} failed: {e}")
-            continue
+    except Exception as e:
+        logger.debug(f"Could not find download button: {e}")
 
     # Fallback: try JavaScript to find and click download
+    print("      Trying JavaScript fallback...")
     result = await page.evaluate("""
         () => {
-            const elements = document.querySelectorAll('a, button');
-            for (const el of elements) {
-                const text = el.textContent || '';
-                const href = el.href || '';
-                if ((text.includes('下载') || text.includes('PDF') || text.includes('全文')) &&
-                    (href.includes('pdf') || href.includes('download') || el.onclick)) {
-                    el.click();
-                    return {clicked: true, href: href};
+            // Find first "下载全文" link
+            const links = document.querySelectorAll('a');
+            for (const link of links) {
+                const text = link.textContent || '';
+                if (text.includes('下载全文') || text.includes('全文下载')) {
+                    return {found: true, href: link.href};
                 }
             }
-            return {clicked: false};
+            return {found: false};
         }
     """)
 
-    if result.get('clicked'):
-        await asyncio.sleep(3)
-        print("      Clicked download via JavaScript, waiting...")
-        # Check downloads directory for new file
-        # This is a fallback - the file may have been downloaded
+    if result.get('found') and result.get('href'):
+        print(f"      Found download link: {result['href'][:50]}...")
+        try:
+            download_link = page.locator(f'a[href="{result["href"]}"]').first
+            if await download_link.count() > 0:
+                async def click_download():
+                    await download_link.click()
+
+                file_path = await browser.handle_download(
+                    click_download,
+                    save_as=filename
+                )
+
+                final_path = PAPERS_DIR / filename
+                if Path(file_path).exists():
+                    import shutil
+                    shutil.move(file_path, final_path)
+                    print(f"      Downloaded: {final_path}")
+                    return str(final_path)
+
+        except Exception as e:
+            logger.warning(f"Fallback download failed: {e}")
 
     return ""
 
@@ -666,6 +787,7 @@ async def download_papers(
     headless: bool = False,
     stay_open: bool = False,
     user_data_dir: str = DEFAULT_USER_DATA_DIR,
+    skip_login_check: bool = False,
 ) -> dict:
     """Main function to download papers from pending CSV.
 
@@ -717,13 +839,25 @@ async def download_papers(
         await asyncio.sleep(2)
 
         # Check login and login if needed
-        is_logged_in = await check_login_status(page)
-        if not is_logged_in and username and password:
-            print("\n🔐 Not logged in, performing login...")
-            login_success = await perform_login(browser, username, password)
-            if not login_success:
-                print("❌ Login failed. Please login manually first using wanfang_login.py")
-                return {"success": 0, "failed": 0, "skipped": len(papers)}
+        if not skip_login_check:
+            is_logged_in = await check_login_status(page)
+            if not is_logged_in and username and password:
+                print("\n🔐 Not logged in, performing login...")
+                login_success = await perform_login(browser, username, password)
+                if not login_success:
+                    print("❌ Auto-login failed.")
+                    print("   Please login manually in the browser window...")
+                    print("   Waiting for login (press Enter when done, or Ctrl+C to cancel)...")
+                    await wait_for_manual_login(page)
+            elif not is_logged_in:
+                print("\n⚠️ Not logged in.")
+                print("   Please login manually in the browser window...")
+                print("   Navigating to login page...")
+                await browser.navigate(LOGIN_URL)
+                print("   Waiting for login (press Enter when done, or Ctrl+C to cancel)...")
+                await wait_for_manual_login(page)
+        else:
+            print("\n⏭️ Skipping login check...")
 
         # Process each paper
         for idx, paper in enumerate(papers, 1):
@@ -747,17 +881,8 @@ async def download_papers(
                     remaining_papers.append(paper)
                     continue
 
-                # Click first result
-                clicked = await click_first_result(browser)
-                if not clicked:
-                    print("      ❌ Could not click result")
-                    append_to_failed(paper, "Could not click search result")
-                    failed_count += 1
-                    remaining_papers.append(paper)
-                    continue
-
-                # Download the paper
-                download_path = await download_paper(browser, title)
+                # Download directly from search results page
+                download_path = await download_paper_from_search(browser, title, username, password)
 
                 if download_path:
                     print(f"      ✅ Success: {Path(download_path).name}")
@@ -825,8 +950,8 @@ def main():
     parser = argparse.ArgumentParser(description="Wanfang Paper Download Script")
     parser.add_argument(
         "--csv", "-c",
-        required=True,
-        help="Path to pending download CSV file",
+        default=str(PENDING_CSV),
+        help=f"Path to pending download CSV file (default: {PENDING_CSV})",
     )
     parser.add_argument(
         "--username", "-u",
@@ -870,6 +995,11 @@ def main():
         default=DEFAULT_USER_DATA_DIR,
         help=f"Browser data directory (default: {DEFAULT_USER_DATA_DIR})",
     )
+    parser.add_argument(
+        "--skip-login-check",
+        action="store_true",
+        help="Skip login status check and proceed directly to download",
+    )
 
     args = parser.parse_args()
 
@@ -900,6 +1030,7 @@ def main():
             headless=args.headless,
             stay_open=args.stay_open,
             user_data_dir=user_data_dir,
+            skip_login_check=args.skip_login_check,
         )
     )
 

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PDF 文献分类</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <div class="nav-bar">
+        <a href="/" class="nav-link">万方下载</a>
+        <a href="/classify" class="nav-link active">文献分类</a>
+      </div>
+
+      <h1>PDF 文献分类</h1>
+      <p class="subtitle">上传 PDF 文件，自动提取并分类</p>
+
+      <div class="card">
+        <div class="row">
+          <div class="left-col">
+            <div class="label">上传文件（PDF / 图片 / TXT / ZIP）</div>
+            <input id="file" type="file" accept=".pdf,.zip,.txt,.png,.jpg,.jpeg,.tif,.tiff,.bmp" multiple />
+            <div id="fileMeta" class="meta"></div>
+          </div>
+          <div class="right-col">
+            <div>
+              <div class="label">OCR 最大页数</div>
+              <input id="maxPages" type="number" min="1" max="200" value="50" style="max-width: 150px;" />
+            </div>
+            <div class="label">药物关键词（逗号分隔）</div>
+            <textarea id="drug-keywords" rows="2" placeholder="例: 替格瑞洛, ticagrelor, Brilinta"></textarea>
+            <button id="btn" class="primary">开始分类</button>
+          </div>
+        </div>
+        <div id="health" class="health"></div>
+        <div id="status" class="status"></div>
+      </div>
+
+      <details class="card help-card">
+        <summary class="label">📋 分类标准与评分规则说明</summary>
+        <div class="help-content">
+          <div class="help-item">
+            <span class="help-label rejection">Rejection</span>
+            <span>
+              <strong>拒绝</strong> - 文章中缺少 drug（目标药物）或 AE（不良事件）任意一个要素<br/>
+              <em style="color:#666;">例：替格瑞洛文章但无AE；心肌梗死文章但无目标药物</em>
+            </span>
+          </div>
+          <div class="help-item">
+            <span class="help-label icsr">ICSR</span>
+            <span>
+              <strong>个例安全报告</strong> - 满足以下任一条件：<br/>
+              • drug + AE + 因果关系 + 单个患者<br/>
+              • drug + 特殊情况 + 单个患者<br/>
+              <em style="color:#666;">例：替格瑞洛+AE+因果关系+单患者</em>
+            </span>
+          </div>
+          <div class="help-item">
+            <span class="help-label multiple">Multiple_Patients</span>
+            <span>
+              <strong>多患者报告</strong> - 与 ICSR 相同标准，但涉及多个患者（>1例）<br/>
+              <em style="color:#666;">例：替格瑞洛+AE+因果关系+多患者队列研究</em>
+            </span>
+          </div>
+          <div class="help-item">
+            <span class="help-label mixed">ICSR+Multiple_Patients</span>
+            <span>
+              <strong>混合报告</strong> - 一篇文章同时满足 ICSR 和 Multiple_Patients 条件<br/>
+              <em style="color:#666;">例：文章中既有单患者个例，又有多患者数据</em>
+            </span>
+          </div>
+          <div class="help-item">
+            <span class="help-label signal">Other_Safety_Signal</span>
+            <span>
+              <strong>其他安全信号</strong> - 有 drug 和 AE，但缺少因果关系或患者信息<br/>
+              <em style="color:#666;">例：替格瑞洛+AE但无因果关系</em>
+            </span>
+          </div>
+
+          <div class="help-note">
+            <strong>特殊情况包括：</strong>儿童用药、药物无效/疗效不佳、怀孕/哺乳期暴露、过量、用药错误、药物相互作用、超说明书用药、职业暴露、药物滥用/依赖、停药反应等
+          </div>
+
+          <div class="scoring-section">
+            <div class="scoring-title">📊 置信度评分规则</div>
+            <div class="scoring-grid">
+              <div class="scoring-item high">
+                <div class="score">90-100% 高置信度</div>
+                <div>所有必需要素完整清晰，可自动接受</div>
+              </div>
+              <div class="scoring-item medium">
+                <div class="score">75-89% 中高置信度</div>
+                <div>主要要素完整，有轻微模糊</div>
+              </div>
+              <div class="scoring-item low">
+                <div class="score">60-74% 中等置信度</div>
+                <div>部分要素缺失或模糊，建议复核</div>
+              </div>
+              <div class="scoring-item very-low">
+                <div class="score">&lt;60% 低置信度</div>
+                <div>关键要素缺失，需人工复核</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <div class="card">
+        <div class="label">分类结果</div>
+        <div id="results-summary" class="results-summary" style="display:none;"></div>
+        <div id="results"></div>
+      </div>
+
+      <div class="footer">
+        <div>支持批量上传多个文件或 ZIP 压缩包</div>
+      </div>
+    </div>
+
+    <script src="/static/classify.js"></script>
+  </body>
+</html>

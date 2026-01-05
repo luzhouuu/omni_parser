@@ -9,6 +9,14 @@ Usage:
 
     # With custom date range:
     python scripts/wanfang_search.py --query '((("得理多") OR "卡马西平") OR "Tegretol") OR "Carbamazepine"' --start-date 2025/10/15 --end-date 2025/11/26
+    python scripts/wanfang_search.py \
+    --query '((("得理多") OR "卡马西平") OR "Tegretol") OR "Carbamazepine"' \
+    --start-date 2025/10/15 \
+    --end-date 2025/11/26 \
+    --export \
+    --no-stay
+
+
 """
 
 import argparse
@@ -22,6 +30,8 @@ from datetime import datetime
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from urllib.parse import quote
+
 from browser_agent.core.browser_controller import BrowserController
 from browser_agent.utils.log_utils import get_logger
 
@@ -29,6 +39,7 @@ logger = get_logger(__name__)
 
 # Wanfang medical search page (default)
 DEFAULT_SEARCH_URL = "https://med.wanfangdata.com.cn/Paper"
+SEARCH_RESULT_URL = "https://med.wanfangdata.com.cn/Paper/Search"
 
 # Default browser data directory for session persistence
 DEFAULT_USER_DATA_DIR = str(Path(__file__).parent.parent / ".browser_data")
@@ -37,12 +48,58 @@ DEFAULT_USER_DATA_DIR = str(Path(__file__).parent.parent / ".browser_data")
 DEFAULT_QUERY = '((("得理多") OR "卡马西平") OR "Tegretol") OR "Carbamazepine"'
 
 
+def build_search_url(
+    query: str,
+    start_year: str = "2019",
+    end_year: str = None,
+    resource_type: str = "chinese",
+) -> str:
+    """Build Wanfang search URL with filters as URL parameters.
+
+    Args:
+        query: Search query formula
+        start_year: Start year for filter
+        end_year: End year for filter (None = current year)
+        resource_type: "chinese", "foreign", or "all"
+
+    Returns:
+        Complete search URL with encoded parameters
+    """
+    # Build query parameter: 主题=(query)
+    q_param = f"主题=({query})"
+
+    # Build year filter: 年份_fl=2024-2025
+    if end_year:
+        year_param = f"{start_year}-{end_year}"
+    else:
+        year_param = f"{start_year}-{datetime.now().year}"
+
+    # Build resource type filter
+    resource_map = {
+        "chinese": "(中文期刊)",
+        "foreign": "(外文期刊)",
+        "all": "(中文期刊 OR 外文期刊)",
+    }
+    resource_param = resource_map.get(resource_type, "(中文期刊)")
+
+    # Build URL with encoded parameters
+    url = (
+        f"{SEARCH_RESULT_URL}"
+        f"?q={quote(q_param)}"
+        f"&年份_fl={quote(year_param)}"
+        f"&资源类型_fl={quote(resource_param)}"
+        f"&SearchMode=Advanced"
+    )
+
+    return url
+
+
 async def perform_search(
     url: str = DEFAULT_SEARCH_URL,
     query: str = DEFAULT_QUERY,
-    year_filter: str = "2019",
-    start_date: str = None,
-    end_date: str = None,
+    start_year: str = "2019",
+    end_year: str = None,
+    resource_type: str = "chinese",
     headless: bool = False,
     stay_open: bool = True,
     user_data_dir: str = DEFAULT_USER_DATA_DIR,
@@ -55,9 +112,9 @@ async def perform_search(
     Args:
         url: Search page URL
         query: Search query formula
-        year_filter: Year filter for initial search (e.g., "2019")
-        start_date: Start date for post-search filter (format: YYYY/MM/DD)
-        end_date: End date for post-search filter (format: YYYY/MM/DD)
+        start_year: Start year for search filter (e.g., "2019")
+        end_year: End year for search filter (e.g., "2025"), None keeps default
+        resource_type: Resource type - "chinese", "foreign", or "all"
         headless: Run browser in headless mode
         stay_open: Keep browser open after search
         user_data_dir: Directory to store browser data
@@ -80,48 +137,34 @@ async def perform_search(
         await browser.start()
         page = browser.page
 
-        # Step 1: Navigate to search page
-        print(f"[1/6] Navigating to: {url}")
-        await browser.navigate(url)
-        await asyncio.sleep(2)
+        # Build search URL with all filters as parameters
+        search_url = build_search_url(
+            query=query,
+            start_year=start_year,
+            end_year=end_year,
+            resource_type=resource_type,
+        )
 
-        # Step 2: Select "中外期刊" (Chinese and Foreign Journals)
-        print(f"[2/6] Selecting '中外期刊' category...")
-        await select_journal_category(page)
-        await asyncio.sleep(0.5)
-
-        # Step 3: Enter search query
-        print(f"[3/6] Entering search query...")
-        await enter_search_query(page, query)
-        await asyncio.sleep(0.5)
-
-        # Step 4: Set year filter
-        print(f"[4/6] Setting year filter to {year_filter}...")
-        await set_year_filter(page, year_filter)
-        await asyncio.sleep(0.5)
-
-        # Step 5: Click search button
-        print(f"[5/6] Clicking search button...")
-        await click_search_button(page)
+        # Step 1: Navigate directly to search results with filters
+        year_range_str = f"{start_year} - {end_year}" if end_year else f"{start_year} - {datetime.now().year}"
+        resource_type_label = {"chinese": "中文期刊", "foreign": "外文期刊", "all": "全部"}
+        print(f"[1/2] Searching with filters:")
+        print(f"      Query: {query[:50]}..." if len(query) > 50 else f"      Query: {query}")
+        print(f"      Year: {year_range_str}")
+        print(f"      Resource: {resource_type_label.get(resource_type, resource_type)}")
+        print(f"[2/2] Navigating to search results...")
+        await browser.navigate(search_url)
         await asyncio.sleep(3)  # Wait for results to load
 
         # Check for captcha and handle if present
         if await check_for_captcha(page):
-            print(f"[5.5/6] Captcha detected, solving...")
+            print(f"[!] Captcha detected, solving...")
             await solve_slider_captcha(browser)
             await asyncio.sleep(2)
 
-        # Step 6: Modify date range in results page (if specified)
-        if start_date and end_date:
-            print(f"[6/7] Setting date range: {start_date} - {end_date}..." if export_results else f"[6/6] Setting date range: {start_date} - {end_date}...")
-            await set_result_date_range(page, start_date, end_date)
-            await asyncio.sleep(2)
-        else:
-            print(f"[6/7] Skipping date range modification (not specified)" if export_results else f"[6/6] Skipping date range modification (not specified)")
-
-        # Step 7: Export results (if enabled)
+        # Export results (if enabled) - directly start export without additional filtering
         if export_results:
-            print(f"[7/7] Exporting search results to Excel...")
+            print(f"\n[Export] Starting export process...")
             exported_count = await export_search_results(browser, export_dir, max_articles)
             print(f"   Exported {exported_count} articles")
 
@@ -156,62 +199,62 @@ async def perform_search(
     return False
 
 
-async def select_journal_category(page):
-    """Select '中外期刊' category."""
+async def select_resource_type(page, resource_type: str = "chinese"):
+    """Select resource type by checking/unchecking checkboxes.
+
+    The checkboxes have specific IDs:
+    - #typeCnPeriodical - 中文期刊
+    - #typeEnPeriodical - 外文期刊
+
+    Args:
+        page: Playwright page object
+        resource_type: One of:
+            - "chinese": Only Chinese journals (uncheck 外文期刊)
+            - "foreign": Only foreign journals (uncheck 中文期刊)
+            - "all": Both Chinese and foreign journals (keep both checked)
+    """
     try:
-        # Try to find and click the journal category tab/button
-        selectors = [
-            'text=中外期刊',
-            '[data-type="中外期刊"]',
-            '.tab:has-text("中外期刊")',
-            'a:has-text("中外期刊")',
-            'span:has-text("中外期刊")',
-            'div:has-text("中外期刊")',
-        ]
-
-        for selector in selectors:
-            try:
-                elem = page.locator(selector).first
-                if await elem.count() > 0:
-                    await elem.click()
-                    await asyncio.sleep(0.5)
-                    logger.info(f"Clicked journal category with selector: {selector}")
-                    return True
-            except Exception:
-                continue
-
-        # Fallback: Try JavaScript
-        result = await page.evaluate("""
-            () => {
-                const elements = document.querySelectorAll('*');
-                for (const el of elements) {
-                    if (el.textContent && el.textContent.trim() === '中外期刊') {
-                        el.click();
-                        return true;
-                    }
-                }
-                // Try partial match
-                for (const el of elements) {
-                    if (el.textContent && el.textContent.includes('中外期刊') &&
-                        (el.tagName === 'A' || el.tagName === 'SPAN' || el.tagName === 'DIV' || el.tagName === 'BUTTON')) {
-                        el.click();
-                        return true;
-                    }
-                }
-                return false;
-            }
-        """)
-
-        if result:
-            await asyncio.sleep(0.5)
-            logger.info("Clicked journal category via JavaScript")
+        if resource_type == "all":
+            logger.info("Keeping both 中文期刊 and 外文期刊 checked")
             return True
 
-        logger.warning("Could not find '中外期刊' category, continuing anyway")
+        # Determine which checkbox to uncheck based on resource type
+        # chinese -> uncheck typeEnPeriodical (外文期刊)
+        # foreign -> uncheck typeCnPeriodical (中文期刊)
+        uncheck_id = "typeEnPeriodical" if resource_type == "chinese" else "typeCnPeriodical"
+        uncheck_label = "外文期刊" if resource_type == "chinese" else "中文期刊"
+
+        result = await page.evaluate("""
+            (checkboxId) => {
+                const checkbox = document.getElementById(checkboxId);
+                if (checkbox) {
+                    if (checkbox.checked) {
+                        checkbox.checked = false;
+                        // Trigger all relevant events
+                        checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+                        checkbox.dispatchEvent(new Event('input', { bubbles: true }));
+                        checkbox.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                        return {success: true, method: 'by_id', wasChecked: true};
+                    } else {
+                        return {success: true, method: 'by_id', wasChecked: false, note: 'already unchecked'};
+                    }
+                }
+                return {success: false, method: 'not_found'};
+            }
+        """, uncheck_id)
+
+        if result and result.get('success'):
+            if result.get('wasChecked'):
+                logger.info(f"Unchecked '{uncheck_label}' (#{uncheck_id})")
+            else:
+                logger.info(f"'{uncheck_label}' was already unchecked")
+            return True
+
+        logger.warning(f"Could not find checkbox #{uncheck_id}")
         return False
 
     except Exception as e:
-        logger.warning(f"Failed to select journal category: {e}")
+        logger.warning(f"Failed to select resource type: {e}")
         return False
 
 
@@ -234,17 +277,14 @@ async def enter_search_query(page, query: str):
                 elem = page.locator(selector).first
                 if await elem.count() > 0:
                     await elem.click()
-                    await asyncio.sleep(0.5)
-                    await elem.fill('')  # Clear existing content
-                    await asyncio.sleep(0.5)
-                    await elem.fill(query)
-                    await asyncio.sleep(0.5)
+                    # Use JavaScript to set value directly (much faster than fill)
+                    await elem.evaluate('(el, q) => { el.value = q; el.dispatchEvent(new Event("input", {bubbles: true})); }', query)
                     logger.info(f"Entered query via selector: {selector}")
                     return True
             except Exception:
                 continue
 
-        # Fallback: JavaScript
+        # Fallback: JavaScript to find and fill input
         result = await page.evaluate("""
             (query) => {
                 const inputs = document.querySelectorAll('input[type="text"], textarea');
@@ -272,7 +312,6 @@ async def enter_search_query(page, query: str):
         """, query)
 
         if result:
-            await asyncio.sleep(0.5)
             logger.info("Entered query via JavaScript")
             return True
 
@@ -284,65 +323,99 @@ async def enter_search_query(page, query: str):
         return False
 
 
-async def set_year_filter(page, year: str):
-    """Set the year filter for the search."""
+async def set_year_filter(page, start_year: str, end_year: str = None):
+    """Set the year filter using custom dropdown selects.
+
+    The year selectors have specific IDs:
+    - #startDateList - 起始年份选择器
+    - #endDateList - 结束年份选择器
+
+    Structure: <div id="startDateList"><h4><span>开始</span></h4><ul><li>2025</li>...</ul></div>
+
+    Args:
+        page: Playwright page object
+        start_year: Start year (e.g., "2019")
+        end_year: End year (e.g., "2025"), if None keeps default "结束"
+    """
     try:
-        # Try to find year input/select
-        selectors = [
-            f'input[placeholder*="年"]',
-            'input.year-input',
-            '#yearFilter',
-            'select.year-select',
-            '[data-field="year"] input',
-        ]
+        async def select_year_from_dropdown(selector_id: str, year: str) -> bool:
+            """Select a year from a custom dropdown.
 
-        for selector in selectors:
-            try:
-                elem = page.locator(selector).first
-                if await elem.count() > 0:
-                    await elem.click()
-                    await asyncio.sleep(0.5)
-                    await elem.fill('')
-                    await asyncio.sleep(0.5)
-                    await elem.fill(year)
-                    await asyncio.sleep(0.5)
-                    logger.info(f"Set year filter via selector: {selector}")
-                    return True
-            except Exception:
-                continue
+            Args:
+                selector_id: ID of the dropdown container (startDateList or endDateList)
+                year: Year to select
+            """
+            # Step 1: Click the dropdown header to open the list
+            opened = await page.evaluate("""
+                (selectorId) => {
+                    const container = document.getElementById(selectorId);
+                    if (!container) return {success: false, error: 'Container not found'};
 
-        # Try finding by label text "出版年份" or "发布年份"
-        result = await page.evaluate("""
-            (year) => {
-                // Look for labels containing year-related text
-                const labels = document.querySelectorAll('label, span, div');
-                for (const label of labels) {
-                    if (label.textContent && (label.textContent.includes('出版年份') ||
-                        label.textContent.includes('发布年份') || label.textContent.includes('年份'))) {
-                        // Find nearby input
-                        const parent = label.closest('div, li, tr');
-                        if (parent) {
-                            const input = parent.querySelector('input');
-                            if (input) {
-                                input.focus();
-                                input.value = year;
-                                input.dispatchEvent(new Event('input', { bubbles: true }));
-                                return true;
-                            }
+                    // Click on h4 or span to open dropdown
+                    const trigger = container.querySelector('h4') || container.querySelector('span');
+                    if (trigger) {
+                        trigger.click();
+                        return {success: true};
+                    }
+                    return {success: false, error: 'Trigger not found'};
+                }
+            """, selector_id)
+
+            if not opened or not opened.get('success'):
+                logger.warning(f"Could not open dropdown #{selector_id}: {opened}")
+                return False
+
+            # Wait for dropdown to open
+            await asyncio.sleep(0.3)
+
+            # Step 2: Click the target year in the list
+            selected = await page.evaluate("""
+                (args) => {
+                    const selectorId = args.selectorId;
+                    const year = args.year;
+
+                    const container = document.getElementById(selectorId);
+                    if (!container) return {success: false, error: 'Container not found'};
+
+                    // Find and click the year in the ul > li list
+                    const items = container.querySelectorAll('li');
+                    for (const item of items) {
+                        if (item.textContent.trim() === year) {
+                            item.click();
+                            // Trigger change event on the container
+                            container.dispatchEvent(new Event('change', { bubbles: true }));
+                            return {success: true, year: year};
                         }
                     }
+                    return {success: false, error: 'Year not found in list', available: Array.from(items).slice(0,5).map(i => i.textContent)};
                 }
-                return false;
-            }
-        """, year)
+            """, {"selectorId": selector_id, "year": year})
 
-        if result:
-            await asyncio.sleep(0.5)
-            logger.info("Set year filter via JavaScript")
-            return True
+            await asyncio.sleep(0.2)
 
-        logger.warning(f"Could not find year filter, continuing without setting year")
-        return False
+            if selected and selected.get('success'):
+                return True
+            else:
+                logger.warning(f"Could not select year: {selected}")
+                return False
+
+        # Set start year
+        start_success = await select_year_from_dropdown("startDateList", start_year)
+        if start_success:
+            logger.info(f"Set start year to {start_year}")
+        else:
+            logger.warning(f"Could not set start year to {start_year}")
+
+        # Set end year if provided
+        if end_year:
+            await asyncio.sleep(0.3)
+            end_success = await select_year_from_dropdown("endDateList", end_year)
+            if end_success:
+                logger.info(f"Set end year to {end_year}")
+            else:
+                logger.warning(f"Could not set end year to {end_year}")
+
+        return start_success
 
     except Exception as e:
         logger.warning(f"Failed to set year filter: {e}")
@@ -399,180 +472,6 @@ async def click_search_button(page):
 
     except Exception as e:
         logger.error(f"Failed to click search button: {e}")
-        return False
-
-
-async def set_result_date_range(page, start_date: str, end_date: str):
-    """Set the date range filter on the results page.
-
-    Args:
-        page: Playwright page object
-        start_date: Start date in format YYYY/MM/DD (will extract year)
-        end_date: End date in format YYYY/MM/DD (will extract year)
-    """
-    try:
-        # Extract years from dates
-        start_year = start_date.split('/')[0] if '/' in start_date else start_date[:4]
-        end_year = end_date.split('/')[0] if '/' in end_date else end_date[:4]
-
-        # First, scroll the left sidebar to find "年份" filter
-        # Try to find the sidebar/filter container
-        sidebar_selectors = [
-            '.search-filter',
-            '.filter-wrap',
-            '.left-side',
-            '[class*="filter"]',
-            '[class*="sidebar"]',
-        ]
-
-        for selector in sidebar_selectors:
-            try:
-                elem = page.locator(selector).first
-                if await elem.count() > 0:
-                    await elem.evaluate('el => el.scrollTop = 300')
-                    await asyncio.sleep(0.3)
-                    break
-            except Exception:
-                continue
-
-        # Look for "年份" section and its input fields
-        year_section_found = False
-        filter_selectors = [
-            'text=年份',
-            'span:has-text("年份")',
-            'div:has-text("年份")',
-            'text=发布时间',
-            '[data-filter="publishDate"]',
-            '.filter-item:has-text("发布时间")',
-            'span:has-text("发布时间")',
-        ]
-
-        # Click on "年份" section to ensure it's expanded
-        for selector in filter_selectors:
-            try:
-                elem = page.locator(selector).first
-                if await elem.count() > 0:
-                    # Scroll element into view first
-                    await elem.scroll_into_view_if_needed()
-                    await asyncio.sleep(0.3)
-                    logger.info(f"Found year filter section: {selector}")
-                    break
-            except Exception:
-                continue
-
-        # Try to set year range using JavaScript - Wanfang uses slider with two input boxes
-        # The inputs are next to "年份" text and show values like "1998" and "2025"
-        result = await page.evaluate("""
-            (years) => {
-                const startYear = years.start;
-                const endYear = years.end;
-
-                // Method 1: Find inputs near "年份" text
-                const yearLabels = Array.from(document.querySelectorAll('*')).filter(
-                    el => el.textContent && el.textContent.trim() === '年份'
-                );
-
-                for (const label of yearLabels) {
-                    // Look for parent container with inputs
-                    let parent = label.parentElement;
-                    for (let i = 0; i < 5 && parent; i++) {
-                        const inputs = parent.querySelectorAll('input[type="text"], input:not([type])');
-                        if (inputs.length >= 2) {
-                            // Found the year range inputs
-                            // First input is start year, second is end year
-                            inputs[0].value = startYear;
-                            inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
-                            inputs[0].dispatchEvent(new Event('change', { bubbles: true }));
-
-                            inputs[1].value = endYear;
-                            inputs[1].dispatchEvent(new Event('input', { bubbles: true }));
-                            inputs[1].dispatchEvent(new Event('change', { bubbles: true }));
-
-                            console.log('Set year range via parent search:', startYear, '-', endYear);
-                            return {success: true, method: 'parent_search'};
-                        }
-                        parent = parent.parentElement;
-                    }
-                }
-
-                // Method 2: Find by input value pattern (4-digit year)
-                const allInputs = Array.from(document.querySelectorAll('input'));
-                const yearInputs = allInputs.filter(input => {
-                    const val = input.value;
-                    return val && /^\\d{4}$/.test(val) && parseInt(val) >= 1900 && parseInt(val) <= 2100;
-                });
-
-                if (yearInputs.length >= 2) {
-                    // Sort by position (left to right)
-                    yearInputs.sort((a, b) => {
-                        const rectA = a.getBoundingClientRect();
-                        const rectB = b.getBoundingClientRect();
-                        return rectA.left - rectB.left;
-                    });
-
-                    yearInputs[0].value = startYear;
-                    yearInputs[0].dispatchEvent(new Event('input', { bubbles: true }));
-                    yearInputs[0].dispatchEvent(new Event('change', { bubbles: true }));
-
-                    yearInputs[1].value = endYear;
-                    yearInputs[1].dispatchEvent(new Event('input', { bubbles: true }));
-                    yearInputs[1].dispatchEvent(new Event('change', { bubbles: true }));
-
-                    console.log('Set year range via value pattern:', startYear, '-', endYear);
-                    return {success: true, method: 'value_pattern'};
-                }
-
-                // Method 3: Find slider component and its inputs
-                const sliders = document.querySelectorAll('[class*="slider"], [class*="range"]');
-                for (const slider of sliders) {
-                    const inputs = slider.querySelectorAll('input');
-                    if (inputs.length >= 2) {
-                        inputs[0].value = startYear;
-                        inputs[0].dispatchEvent(new Event('input', { bubbles: true }));
-                        inputs[0].dispatchEvent(new Event('change', { bubbles: true }));
-
-                        inputs[1].value = endYear;
-                        inputs[1].dispatchEvent(new Event('input', { bubbles: true }));
-                        inputs[1].dispatchEvent(new Event('change', { bubbles: true }));
-
-                        console.log('Set year range via slider:', startYear, '-', endYear);
-                        return {success: true, method: 'slider'};
-                    }
-                }
-
-                return {success: false, method: 'none'};
-            }
-        """, {"start": start_year, "end": end_year})
-
-        if result and result.get('success'):
-            await asyncio.sleep(0.5)
-            logger.info(f"Set year range {start_year}-{end_year} via JavaScript ({result.get('method')})")
-        else:
-            logger.warning(f"Could not set year range via JavaScript")
-
-        # Try to click apply/confirm button if exists
-        apply_selectors = [
-            'button:has-text("确定")',
-            'button:has-text("应用")',
-            'button:has-text("筛选")',
-            '.date-confirm',
-        ]
-
-        for selector in apply_selectors:
-            try:
-                elem = page.locator(selector).first
-                if await elem.count() > 0:
-                    await elem.click()
-                    await asyncio.sleep(1)  # Wait for filter to apply
-                    logger.info(f"Clicked apply button: {selector}")
-                    return True
-            except Exception:
-                continue
-
-        return result and result.get('success', False)
-
-    except Exception as e:
-        logger.warning(f"Failed to set date range: {e}")
         return False
 
 
@@ -727,54 +626,6 @@ async def solve_slider_captcha(browser: BrowserController) -> bool:
 
 # ============== Export Functions ==============
 
-async def filter_chinese_journals(page) -> bool:
-    """Filter results to show only Chinese journals (中文期刊)."""
-    try:
-        selectors = [
-            'text=中文期刊',
-            '.filter-item:has-text("中文期刊")',
-            'label:has-text("中文期刊")',
-            'a:has-text("中文期刊")',
-        ]
-
-        for selector in selectors:
-            try:
-                elem = page.locator(selector).first
-                if await elem.count() > 0:
-                    await elem.click()
-                    await asyncio.sleep(0.5)
-                    logger.info(f"Filtered by Chinese journals: {selector}")
-                    return True
-            except Exception:
-                continue
-
-        # Fallback: JavaScript
-        result = await page.evaluate("""
-            () => {
-                const elements = document.querySelectorAll('*');
-                for (const el of elements) {
-                    if (el.textContent && el.textContent.trim() === '中文期刊') {
-                        el.click();
-                        return true;
-                    }
-                }
-                return false;
-            }
-        """)
-
-        if result:
-            await asyncio.sleep(0.5)
-            logger.info("Filtered by Chinese journals via JavaScript")
-            return True
-
-        logger.warning("Could not find Chinese journals filter")
-        return False
-
-    except Exception as e:
-        logger.warning(f"Failed to filter Chinese journals: {e}")
-        return False
-
-
 async def get_total_results(page) -> int:
     """Get total number of search results."""
     try:
@@ -881,7 +732,6 @@ async def select_all_articles(page) -> bool:
                 elem = page.locator(selector).first
                 if await elem.count() > 0:
                     await elem.click()
-                    await asyncio.sleep(0.5)
                     logger.info(f"Selected all articles: {selector}")
                     return True
             except Exception:
@@ -908,7 +758,6 @@ async def select_all_articles(page) -> bool:
         """)
 
         if result:
-            await asyncio.sleep(0.5)
             logger.info("Selected all articles via JavaScript")
             return True
 
@@ -937,9 +786,7 @@ async def click_reference_export(page) -> bool:
                 elem = page.locator(selector).first
                 if await elem.count() > 0:
                     await elem.hover()  # Hover to show dropdown
-                    await asyncio.sleep(0.5)
                     await elem.click()
-                    await asyncio.sleep(0.5)
                     logger.info(f"Clicked batch export button: {selector}")
                     clicked_batch = True
                     break
@@ -961,7 +808,6 @@ async def click_reference_export(page) -> bool:
                 }
             """)
             if result:
-                await asyncio.sleep(0.5)
                 clicked_batch = True
                 logger.info("Clicked batch export via JavaScript")
 
@@ -969,15 +815,22 @@ async def click_reference_export(page) -> bool:
             logger.warning("Could not find batch export button")
             return False
 
-        # Step 2: Click '参考文献' from dropdown menu
-        await asyncio.sleep(0.5)  # Wait for dropdown to appear
-
+        # Step 2: Wait for dropdown menu to appear, then click '参考文献'
         ref_selectors = [
             'text=参考文献',
             'a:has-text("参考文献")',
             'li:has-text("参考文献")',
             'div:has-text("参考文献")',
         ]
+
+        # Wait for dropdown item to be visible
+        for selector in ref_selectors:
+            try:
+                elem = page.locator(selector).first
+                await elem.wait_for(state='visible', timeout=3000)
+                break
+            except Exception:
+                continue
 
         for selector in ref_selectors:
             try:
@@ -990,7 +843,6 @@ async def click_reference_export(page) -> bool:
                     # Make sure it's exactly "参考文献" not "批量导出" containing it
                     if text and text.strip() == '参考文献':
                         await elem.click()
-                        await asyncio.sleep(1)
                         logger.info(f"Clicked reference export option: {selector}")
                         return True
             except Exception:
@@ -1011,7 +863,6 @@ async def click_reference_export(page) -> bool:
         """)
 
         if result:
-            await asyncio.sleep(1)
             logger.info("Clicked reference option via JavaScript")
             return True
 
@@ -1033,10 +884,7 @@ async def export_to_excel(browser: BrowserController, export_dir: str, batch_num
     os.makedirs(export_dir, exist_ok=True)
 
     try:
-        # Wait a bit more for dialog to fully load
-        await asyncio.sleep(1)
-
-        # Find and click '导出到Excel' button - try multiple selectors
+        # Wait for export dialog to appear (wait for Excel button to be visible)
         selectors = [
             'text=导出到Excel',
             'text=导出Excel',
@@ -1047,20 +895,30 @@ async def export_to_excel(browser: BrowserController, export_dir: str, batch_num
             'div:has-text("导出到Excel")',
         ]
 
+        # Wait for any Excel button to appear
+        for selector in selectors:
+            try:
+                elem = page.locator(selector).first
+                await elem.wait_for(state='visible', timeout=3000)
+                break
+            except Exception:
+                continue
+
         for selector in selectors:
             try:
                 elem = page.locator(selector).first
                 if await elem.count() > 0:
-                    # Handle download
+                    # Handle download with Playwright's expect_download
                     async def click_export():
                         await elem.click()
+                        # Check for and dismiss any alert dialog (like "导出记录数量超额")
+                        await dismiss_export_alert(page)
 
                     file_path = await browser.handle_download(
                         click_export,
                         save_as=f"wanfang_export_batch_{batch_num}.xlsx"
                     )
                     logger.info(f"Exported to: {file_path}")
-                    await asyncio.sleep(0.5)
 
                     # Close the export dialog after download
                     await close_export_dialog(page)
@@ -1070,34 +928,39 @@ async def export_to_excel(browser: BrowserController, export_dir: str, batch_num
                 logger.debug(f"Selector {selector} failed: {e}")
                 continue
 
-        # Fallback: Try JavaScript click with more patterns
-        result = await page.evaluate("""
-            () => {
-                // Look for Excel export button in any element
-                const elements = document.querySelectorAll('button, a, span, div, li');
-                for (const el of elements) {
-                    const text = el.textContent || '';
-                    if (text.includes('导出到Excel') || text.includes('导出Excel') ||
-                        text.includes('导出至Excel') || (text.includes('Excel') && text.includes('导出'))) {
-                        el.click();
+        # Fallback: Try JavaScript click with download handling
+        async with page.expect_download(timeout=30000) as download_info:
+            result = await page.evaluate("""
+                () => {
+                    // Look for Excel export button in any element
+                    const elements = document.querySelectorAll('button, a, span, div, li');
+                    for (const el of elements) {
+                        const text = el.textContent || '';
+                        if (text.includes('导出到Excel') || text.includes('导出Excel') ||
+                            text.includes('导出至Excel') || (text.includes('Excel') && text.includes('导出'))) {
+                            el.click();
+                            return true;
+                        }
+                    }
+                    // Try finding by class or other attributes
+                    const excelBtn = document.querySelector('[class*="excel"], [class*="export"]');
+                    if (excelBtn && excelBtn.textContent.includes('Excel')) {
+                        excelBtn.click();
                         return true;
                     }
+                    return false;
                 }
-                // Try finding by class or other attributes
-                const excelBtn = document.querySelector('[class*="excel"], [class*="export"]');
-                if (excelBtn && excelBtn.textContent.includes('Excel')) {
-                    excelBtn.click();
-                    return true;
-                }
-                return false;
-            }
-        """)
+            """)
+            # Check for and dismiss any alert dialog (like "导出记录数量超额")
+            await dismiss_export_alert(page)
 
         if result:
-            await asyncio.sleep(3)  # Wait for download
-            logger.info("Clicked Excel export via JavaScript")
+            download = await download_info.value
+            download_path = f"/tmp/browser_agent_screenshots/downloads/wanfang_export_batch_{batch_num}.xlsx"
+            await download.save_as(download_path)
+            logger.info(f"Clicked Excel export via JavaScript, saved to: {download_path}")
             await close_export_dialog(page)
-            return f"{export_dir}/wanfang_export_batch_{batch_num}.xlsx"
+            return download_path
 
         logger.warning("Could not find Excel export button")
         return ""
@@ -1107,6 +970,70 @@ async def export_to_excel(browser: BrowserController, export_dir: str, batch_num
         return ""
 
 
+async def dismiss_export_alert(page) -> bool:
+    """Dismiss the '导出记录数量超额' alert dialog by clicking '确定'.
+
+    This alert appears when the number of records exceeds export limits.
+    We need to click '确定' to acknowledge and continue.
+    """
+    try:
+        await asyncio.sleep(0.5)  # Brief wait for dialog to appear
+
+        # Look for the confirm button in the alert dialog
+        confirm_selectors = [
+            'button:has-text("确定")',
+            'button:has-text("确认")',
+            'a:has-text("确定")',
+            'span:has-text("确定")',
+            '.modal button:has-text("确定")',
+            '.dialog button:has-text("确定")',
+            '[class*="modal"] button:has-text("确定")',
+            '[class*="dialog"] button:has-text("确定")',
+        ]
+
+        for selector in confirm_selectors:
+            try:
+                elem = page.locator(selector).first
+                if await elem.count() > 0 and await elem.is_visible():
+                    await elem.click()
+                    logger.info(f"Dismissed export alert dialog: {selector}")
+                    await asyncio.sleep(0.3)
+                    return True
+            except Exception:
+                continue
+
+        # Fallback: JavaScript click
+        result = await page.evaluate("""
+            () => {
+                // Look for modal/dialog with "确定" button
+                const buttons = document.querySelectorAll('button, a, span');
+                for (const btn of buttons) {
+                    const text = (btn.textContent || '').trim();
+                    if (text === '确定' || text === '确认') {
+                        // Check if this button is inside a modal/dialog
+                        const parent = btn.closest('.modal, .dialog, [class*="modal"], [class*="dialog"], [role="dialog"]');
+                        if (parent || btn.offsetParent !== null) {
+                            btn.click();
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+        """)
+
+        if result:
+            logger.info("Dismissed export alert via JavaScript")
+            await asyncio.sleep(0.3)
+            return True
+
+        return False
+
+    except Exception as e:
+        logger.debug(f"No export alert to dismiss: {e}")
+        return False
+
+
 async def close_export_dialog(page) -> bool:
     """Close the export dialog/panel after exporting.
 
@@ -1114,7 +1041,8 @@ async def close_export_dialog(page) -> bool:
     as we need to preserve the current pagination state.
     """
     try:
-        await asyncio.sleep(0.5)
+        # First, try to dismiss any alert dialog (like "导出记录数量超额")
+        await dismiss_export_alert(page)
 
         # Try to close any modal/dialog
         close_selectors = [
@@ -1132,7 +1060,6 @@ async def close_export_dialog(page) -> bool:
                 elem = page.locator(selector).first
                 if await elem.count() > 0:
                     await elem.click()
-                    await asyncio.sleep(0.5)
                     logger.info(f"Closed export dialog: {selector}")
                     return True
             except Exception:
@@ -1140,12 +1067,10 @@ async def close_export_dialog(page) -> bool:
 
         # Try pressing Escape to close any dialog
         await page.keyboard.press("Escape")
-        await asyncio.sleep(0.5)
         logger.info("Pressed Escape to close dialog")
 
         # Try clicking outside the dialog to close it
         await page.mouse.click(100, 100)
-        await asyncio.sleep(0.5)
 
         # NOTE: Removed page.go_back() as it resets pagination to page 1
         # The export dialog on Wanfang is typically a modal overlay
@@ -1173,7 +1098,6 @@ async def clear_selection(page) -> bool:
                 elem = page.locator(selector).first
                 if await elem.count() > 0:
                     await elem.click()
-                    await asyncio.sleep(0.5)
                     logger.info(f"Cleared selection: {selector}")
                     return True
             except Exception:
@@ -1194,7 +1118,6 @@ async def clear_selection(page) -> bool:
         """)
 
         if result:
-            await asyncio.sleep(0.5)
             logger.info("Cleared selection via JavaScript")
             return True
 
@@ -1264,7 +1187,6 @@ async def go_to_next_page(page) -> bool:
                             return False
 
                         await elem.click()
-                        await asyncio.sleep(1)
                         logger.info("Clicked '>' to go to next page")
                         return True
             except Exception:
@@ -1289,7 +1211,6 @@ async def go_to_next_page(page) -> bool:
         """)
 
         if result:
-            await asyncio.sleep(1)
             logger.info("Navigated to next page via JavaScript")
             return True
 
@@ -1304,8 +1225,8 @@ async def go_to_next_page(page) -> bool:
 async def export_search_results(browser: BrowserController, export_dir: str, max_articles: int = 0) -> int:
     """Export all search results by going through every page.
 
-    Simple workflow:
-    1. Filter by Chinese journals
+    Simple workflow (filtering already done on search page):
+    1. Set page size to 50
     2. On each page: select all → export → clear
     3. Go to next page, repeat until last page
 
@@ -1319,14 +1240,9 @@ async def export_search_results(browser: BrowserController, export_dir: str, max
     """
     page = browser.page
 
-    # Step 1: Filter by Chinese journals
-    print("   Filtering by 中文期刊...")
-    await filter_chinese_journals(page)
-    await asyncio.sleep(1)
-
-    # Step 2: Get total results after filtering
+    # Get total results (filtering already done on search page)
     total = await get_total_results(page)
-    print(f"   Total Chinese journal results: {total}")
+    print(f"   Total results: {total}")
 
     if total == 0:
         logger.warning("No results to export")
@@ -1356,8 +1272,11 @@ async def export_search_results(browser: BrowserController, export_dir: str, max
 
     # Keep going through pages until the last one
     while current_page <= total_pages:
-        # Wait for page to be ready
-        await asyncio.sleep(1)
+        # Wait for page content to be ready (wait for article list to appear)
+        try:
+            await page.wait_for_selector('.paper-list, .result-list, [class*="paper"], [class*="result"]', timeout=5000)
+        except Exception:
+            pass  # Continue even if selector not found
 
         # Verify we're on the correct page by checking the current page number
         actual_page = await page.evaluate("""
@@ -1384,12 +1303,10 @@ async def export_search_results(browser: BrowserController, export_dir: str, max
 
         print(f"   [Page {current_page}/{total_pages}] Selecting all articles...")
         await select_all_articles(page)
-        await asyncio.sleep(0.5)
 
         # Export this page
         print(f"   [Page {current_page}/{total_pages}] Opening export dialog...")
         await click_reference_export(page)
-        await asyncio.sleep(1)
 
         print(f"   [Page {current_page}/{total_pages}] Exporting to Excel...")
         file_path = await export_to_excel(browser, export_dir, current_page)
@@ -1415,7 +1332,6 @@ async def export_search_results(browser: BrowserController, export_dir: str, max
         # Clear selection before going to next page
         print(f"   [Page {current_page}/{total_pages}] Clearing selection...")
         await clear_selection(page)
-        await asyncio.sleep(0.5)
 
         # Go to next page FIRST, then loop back to export
         print(f"   [Page {current_page}/{total_pages}] Going to next page...")
@@ -1425,7 +1341,11 @@ async def export_search_results(browser: BrowserController, export_dir: str, max
             print(f"   No more pages available (stopped at page {current_page})")
             break
 
-        await asyncio.sleep(2)  # Wait longer for page content to load
+        # Wait for new page content to load (network idle or timeout)
+        try:
+            await page.wait_for_load_state('networkidle', timeout=5000)
+        except Exception:
+            await asyncio.sleep(0.5)  # Fallback short wait
         current_page += 1
 
     print(f"   Export complete: ~{exported} articles across {current_page} page(s)")
@@ -1629,9 +1549,7 @@ def filter_and_update_history(unique_rows: list, header_row: list) -> tuple:
             print(f"   No new articles to download")
             return 0, ""
 
-        # Generate timestamp for pending file
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        pending_csv_path = DATA_DIR / f"pending_download_{timestamp}.csv"
+        pending_csv_path = DATA_DIR / "pending_download.csv"
 
         # Write new articles to pending CSV
         with open(pending_csv_path, 'w', encoding='utf-8-sig') as f:
@@ -1645,19 +1563,10 @@ def filter_and_update_history(unique_rows: list, header_row: list) -> tuple:
                     row[0] = str(idx)
                 f.write(','.join(f'"{c}"' for c in row) + '\n')
 
-        # Update history with all unique articles (append new ones)
-        with open(HISTORY_CSV, 'a', encoding='utf-8-sig') as f:
-            # Write header if file is new
-            if not existing_titles and header_row:
-                f.write(','.join(f'"{c}"' for c in header_row) + '\n')
-
-            # Append new articles to history
-            for idx, row in enumerate(new_rows, len(existing_titles) + 1):
-                if row:
-                    row[0] = str(idx)
-                f.write(','.join(f'"{c}"' for c in row) + '\n')
-
-        print(f"   Updated history: {HISTORY_CSV}")
+        # NOTE: Do NOT update history here!
+        # History should only be updated when download succeeds (in wanfang_download.py)
+        # This prevents marking articles as "downloaded" when they haven't been
+        print(f"   Pending download list: {pending_csv_path}")
 
         return len(new_rows), str(pending_csv_path)
 
@@ -1681,19 +1590,20 @@ def main():
         help=f"Search query formula (default: {DEFAULT_QUERY})",
     )
     parser.add_argument(
-        "--year", "-y",
+        "--start-year", "-s",
         default="2019",
-        help="Year filter for initial search (default: 2019)",
+        help="Start year for search filter (default: 2019)",
     )
     parser.add_argument(
-        "--start-date", "-s",
+        "--end-year", "-e",
         default=None,
-        help="Start date for results filter (format: YYYY/MM/DD, e.g., 2025/10/15)",
+        help="End year for search filter (default: None, keeps '结束')",
     )
     parser.add_argument(
-        "--end-date", "-e",
-        default=None,
-        help="End date for results filter (format: YYYY/MM/DD, e.g., 2025/11/26)",
+        "--resource-type", "-r",
+        default="chinese",
+        choices=["chinese", "foreign", "all"],
+        help="Resource type: chinese (中文期刊), foreign (外文期刊), all (both) (default: chinese)",
     )
     parser.add_argument(
         "--headless",
@@ -1741,9 +1651,8 @@ def main():
     print("=" * 60)
     print(f"URL: {args.url}")
     print(f"Query: {args.query[:50]}..." if len(args.query) > 50 else f"Query: {args.query}")
-    print(f"Year Filter: {args.year}")
-    if args.start_date and args.end_date:
-        print(f"Date Range: {args.start_date} - {args.end_date}")
+    print(f"Year Range: {args.start_year} - {args.end_year or '结束'}")
+    print(f"Resource Type: {args.resource_type}")
     print(f"Headless: {args.headless}")
     if args.export:
         print(f"Export: Enabled")
@@ -1756,9 +1665,9 @@ def main():
         perform_search(
             url=args.url,
             query=args.query,
-            year_filter=args.year,
-            start_date=args.start_date,
-            end_date=args.end_date,
+            start_year=args.start_year,
+            end_year=args.end_year,
+            resource_type=args.resource_type,
             headless=args.headless,
             stay_open=not args.no_stay,
             user_data_dir=user_data_dir,
