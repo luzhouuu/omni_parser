@@ -507,11 +507,11 @@ function renderResults(results) {
 
         // Build extraction fields for details
         const extractionFields = [
-            { label: "目标药物", value: r.has_drug === 'True', evidence: drugEvidence },
-            { label: "不良事件", value: r.has_ae === 'True', evidence: aeEvidence },
-            { label: "因果关系", value: r.has_causality === 'True', evidence: causalityEvidence },
-            { label: "特殊情况", value: r.has_special_situation === 'True', evidence: specialEvidence },
-            { label: "患者模式", value: patientDisplay, evidence: patientEvidence, isText: true },
+            { label: "目标药物", value: r.has_drug === 'True', evidence: drugEvidence, reasoning: r.has_drug_reasoning },
+            { label: "不良事件", value: r.has_ae === 'True', evidence: aeEvidence, reasoning: r.has_ae_reasoning },
+            { label: "因果关系", value: r.has_causality === 'True', evidence: causalityEvidence, reasoning: r.has_causality_reasoning },
+            { label: "特殊情况", value: r.has_special_situation === 'True', evidence: specialEvidence, reasoning: r.has_special_reasoning },
+            { label: "患者模式", value: patientDisplay, evidence: patientEvidence, reasoning: r.patient_reasoning, isText: true },
         ];
 
         // Rule logic explanation
@@ -556,6 +556,10 @@ function renderResults(results) {
                                                     : `<span class="extraction-value ${f.value ? 'yes' : 'no'}">${f.value ? '是 ✓' : '否 ✗'}</span>`
                                                 }
                                             </div>
+                                            ${f.reasoning
+                                                ? `<div class="extraction-reasoning">${escapeHtml(f.reasoning)}</div>`
+                                                : ''
+                                            }
                                             ${f.evidence && f.evidence.length > 0
                                                 ? `<div class="extraction-evidence">${f.evidence.slice(0, 2).map(e => `<span class="evidence-snippet">"${escapeHtml(truncate(e, 80))}"</span>`).join('')}</div>`
                                                 : ''
@@ -623,4 +627,9 @@ function escapeHtml(str) {
 function truncate(str, len) {
     if (!str) return '';
     return str.length > len ? str.slice(0, len) + '...' : str;
+}
+
+// Download results CSV
+function downloadResults() {
+    window.location.href = '/api/download';
 }

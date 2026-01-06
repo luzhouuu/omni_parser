@@ -48,6 +48,7 @@ load_dotenv()
 DATA_DIR = Path(__file__).parent.parent / "data"
 PAPERS_DIR = DATA_DIR / "papers"
 DEFAULT_OUTPUT = DATA_DIR / "classification_results.csv"
+DEFAULT_DRUGS_FILE = DATA_DIR / "novartis_drugs.txt"
 
 
 # Classification labels
@@ -86,6 +87,12 @@ class ClassificationResult:
     causality_evidence: list[str]
     special_evidence: list[str]
     patient_evidence: list[str]
+    # 各字段的独立 reasoning
+    has_drug_reasoning: str
+    has_ae_reasoning: str
+    has_causality_reasoning: str
+    has_special_reasoning: str
+    patient_reasoning: str
     reasoning: str
     needs_review: bool
     extract_method: str
@@ -200,7 +207,9 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
             has_drug=False, has_ae=False, has_causality=False, has_special_situation=False,
             patient_mode="unknown", patient_max_n=None, confidence=0.0,
             drug_evidence=[], ae_evidence=[], causality_evidence=[],
-            special_evidence=[], patient_evidence=[], reasoning="",
+            special_evidence=[], patient_evidence=[],
+            has_drug_reasoning="", has_ae_reasoning="", has_causality_reasoning="",
+            has_special_reasoning="", patient_reasoning="", reasoning="",
             needs_review=True, extract_method="", text_length=0,
             error="OPENAI_API_KEY not set"
         )
@@ -292,13 +301,18 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
 返回JSON格式:
 {{
   "has_drug": boolean,
+  "has_drug_reasoning": "判断理由：为何认为有/无目标诺华药物",
   "has_ae": boolean,
+  "has_ae_reasoning": "判断理由：为何认为有/无不良事件描述",
   "has_causality": boolean,
+  "has_causality_reasoning": "判断理由：为何认为有/无因果关系表述",
   "has_special_situation": boolean,
+  "has_special_reasoning": "判断理由：为何认为有/无特殊情况",
   "patient_mode": "single|multiple|mixed|unknown",
+  "patient_reasoning": "判断理由：为何判定为该患者模式",
   "patient_max_n": integer or null,
   "confidence": 0.0-1.0,
-  "reasoning": "简要说明分析过程，包括为何判定为某个分类",
+  "reasoning": "整体分析总结",
   "evidence": {{
     "drug": ["原文中提及药物的证据"],
     "ae": ["原文中不良事件的描述"],
@@ -363,6 +377,13 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
         special_evidence = evidence.get("special_situation", []) or []
         patient_evidence = evidence.get("patient", []) or []
 
+        # Extract per-field reasoning
+        has_drug_reasoning = obj.get("has_drug_reasoning", "")
+        has_ae_reasoning = obj.get("has_ae_reasoning", "")
+        has_causality_reasoning = obj.get("has_causality_reasoning", "")
+        has_special_reasoning = obj.get("has_special_reasoning", "")
+        patient_reasoning = obj.get("patient_reasoning", "")
+
         return ClassificationResult(
             filename=filename,
             label=label,
@@ -379,6 +400,11 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
             causality_evidence=causality_evidence[:5],
             special_evidence=special_evidence[:5],
             patient_evidence=patient_evidence[:5],
+            has_drug_reasoning=has_drug_reasoning,
+            has_ae_reasoning=has_ae_reasoning,
+            has_causality_reasoning=has_causality_reasoning,
+            has_special_reasoning=has_special_reasoning,
+            patient_reasoning=patient_reasoning,
             reasoning=obj.get("reasoning", ""),
             needs_review=confidence < 0.65,
             extract_method="",
@@ -391,7 +417,9 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
             has_drug=False, has_ae=False, has_causality=False, has_special_situation=False,
             patient_mode="unknown", patient_max_n=None, confidence=0.0,
             drug_evidence=[], ae_evidence=[], causality_evidence=[],
-            special_evidence=[], patient_evidence=[], reasoning="",
+            special_evidence=[], patient_evidence=[],
+            has_drug_reasoning="", has_ae_reasoning="", has_causality_reasoning="",
+            has_special_reasoning="", patient_reasoning="", reasoning="",
             needs_review=True, extract_method="", text_length=len(text),
             error=f"JSON parse error: {e}"
         )
@@ -401,7 +429,9 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
             has_drug=False, has_ae=False, has_causality=False, has_special_situation=False,
             patient_mode="unknown", patient_max_n=None, confidence=0.0,
             drug_evidence=[], ae_evidence=[], causality_evidence=[],
-            special_evidence=[], patient_evidence=[], reasoning="",
+            special_evidence=[], patient_evidence=[],
+            has_drug_reasoning="", has_ae_reasoning="", has_causality_reasoning="",
+            has_special_reasoning="", patient_reasoning="", reasoning="",
             needs_review=True, extract_method="", text_length=len(text),
             error=str(e)
         )
@@ -453,7 +483,9 @@ def classify_papers(
                 has_drug=False, has_ae=False, has_causality=False, has_special_situation=False,
                 patient_mode="unknown", patient_max_n=None, confidence=0.0,
                 drug_evidence=[], ae_evidence=[], causality_evidence=[],
-                special_evidence=[], patient_evidence=[], reasoning="",
+                special_evidence=[], patient_evidence=[],
+                has_drug_reasoning="", has_ae_reasoning="", has_causality_reasoning="",
+                has_special_reasoning="", patient_reasoning="", reasoning="",
                 needs_review=True, extract_method=method, text_length=0,
                 error="Text extraction failed"
             ))
@@ -493,6 +525,8 @@ def classify_papers(
         "has_drug", "has_ae", "has_causality", "has_special_situation",
         "patient_mode", "patient_max_n",
         "drug_evidence", "ae_evidence", "causality_evidence", "special_evidence", "patient_evidence",
+        "has_drug_reasoning", "has_ae_reasoning", "has_causality_reasoning",
+        "has_special_reasoning", "patient_reasoning",
         "reasoning", "extract_method", "text_length", "classify_time", "error"
     ]
 
@@ -576,6 +610,11 @@ def main():
         drug_keywords.extend([k.strip() for k in args.drugs.split(",") if k.strip()])
     if args.drugs_file:
         drug_keywords.extend(load_drug_keywords(args.drugs_file))
+
+    # 如果没有提供药物关键词，尝试加载默认清单
+    if not drug_keywords and DEFAULT_DRUGS_FILE.exists():
+        drug_keywords.extend(load_drug_keywords(DEFAULT_DRUGS_FILE))
+        print(f"Loaded default drug keywords from: {DEFAULT_DRUGS_FILE}")
 
     if not drug_keywords:
         print("Warning: No drug keywords provided. Use --drugs or --drugs-file")

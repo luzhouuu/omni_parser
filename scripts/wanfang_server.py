@@ -390,6 +390,9 @@ class AppHandler(BaseHTTPRequestHandler):
             if path == "/api/results":
                 return self._handle_results()
 
+            if path == "/api/download":
+                return self._handle_download()
+
             raise ApiError(HTTPStatus.NOT_FOUND, "not_found")
 
         except ApiError as e:
@@ -466,6 +469,22 @@ class AppHandler(BaseHTTPRequestHandler):
             "count": len(results),
             "file": str(results_path),
         })
+
+    def _handle_download(self) -> None:
+        """Download classification results as CSV."""
+        results_path = DATA_DIR / "classification_results.csv"
+        if not results_path.exists():
+            raise ApiError(HTTPStatus.NOT_FOUND, "no_results")
+
+        data = results_path.read_bytes()
+        filename = f"classification_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/csv; charset=utf-8-sig")
+        self.send_header("Content-Disposition", f"attachment; filename={filename}")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_pipeline(self) -> None:
         """Start a new pipeline task."""

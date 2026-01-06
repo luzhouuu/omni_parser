@@ -208,6 +208,23 @@ button:disabled {
   cursor: not-allowed;
 }
 
+/* Download button */
+.download-btn {
+  padding: 8px 16px;
+  background: var(--ok);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  transition: opacity 0.2s;
+}
+
+.download-btn:hover {
+  opacity: 0.9;
+}
+
 .meta,
 .health {
   margin-top: 10px;
@@ -676,6 +693,17 @@ details[open] summary {
 .extraction-value.text {
   background: rgba(4, 96, 169, 0.1);
   color: var(--info);
+}
+
+.extraction-reasoning {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.5;
+  margin: 6px 0;
+  padding: 6px 8px;
+  background: #fff;
+  border-radius: 4px;
+  border-left: 2px solid var(--primary);
 }
 
 .extraction-evidence {

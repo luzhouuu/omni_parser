@@ -27,6 +27,10 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -53,42 +57,45 @@ def build_search_url(
     start_year: str = "2019",
     end_year: str = None,
     resource_type: str = "chinese",
+    page: int = 1,
+    per_page: int = 50,
 ) -> str:
     """Build Wanfang search URL with filters as URL parameters.
 
     Args:
         query: Search query formula
         start_year: Start year for filter
-        end_year: End year for filter (None = current year)
+        end_year: End year for filter (None = * for unlimited)
         resource_type: "chinese", "foreign", or "all"
+        page: Page number (1-based)
+        per_page: Number of results per page
 
     Returns:
         Complete search URL with encoded parameters
     """
-    # Build query parameter: 主题=(query)
-    q_param = f"主题=({query})"
-
-    # Build year filter: 年份_fl=2024-2025
+    # Build year filter: 年份_fl=2009-* or 2009-2025
     if end_year:
         year_param = f"{start_year}-{end_year}"
     else:
-        year_param = f"{start_year}-{datetime.now().year}"
+        year_param = f"{start_year}-*"  # * means unlimited (至今)
 
-    # Build resource type filter
+    # Build resource type filter (include 学位论文 and 会议论文)
     resource_map = {
-        "chinese": "(中文期刊)",
+        "chinese": "(中文期刊 OR 学位论文 OR 会议论文)",
         "foreign": "(外文期刊)",
-        "all": "(中文期刊 OR 外文期刊)",
+        "all": "(中文期刊 OR 外文期刊 OR 学位论文 OR 会议论文)",
     }
-    resource_param = resource_map.get(resource_type, "(中文期刊)")
+    resource_param = resource_map.get(resource_type, "(中文期刊 OR 学位论文 OR 会议论文)")
 
-    # Build URL with encoded parameters
+    # Build URL with encoded parameters (no 主题= prefix)
     url = (
         f"{SEARCH_RESULT_URL}"
-        f"?q={quote(q_param)}"
+        f"?q={quote(query)}"
         f"&年份_fl={quote(year_param)}"
         f"&资源类型_fl={quote(resource_param)}"
-        f"&SearchMode=Advanced"
+        f"&SearchMode=Professional"
+        f"&n={per_page}"
+        f"&p={page}"
     )
 
     return url
@@ -165,7 +172,15 @@ async def perform_search(
         # Export results (if enabled) - directly start export without additional filtering
         if export_results:
             print(f"\n[Export] Starting export process...")
-            exported_count = await export_search_results(browser, export_dir, max_articles)
+            exported_count = await export_search_results(
+                browser=browser,
+                export_dir=export_dir,
+                max_articles=max_articles,
+                query=query,
+                start_year=start_year,
+                end_year=end_year,
+                resource_type=resource_type,
+            )
             print(f"   Exported {exported_count} articles")
 
         # Capture result screenshot
@@ -475,6 +490,82 @@ async def click_search_button(page):
         return False
 
 
+async def is_login_page(page) -> bool:
+    """Check if current page is the login page."""
+    try:
+        title = await page.title()
+        if "登录" in title:
+            return True
+        # Check URL
+        url = page.url
+        if "login" in url.lower() or "logon" in url.lower():
+            return True
+        return False
+    except Exception:
+        return False
+
+
+async def perform_page_login(browser, page, username: str = None, password: str = None) -> bool:
+    """Perform login on the login page.
+
+    Credentials are read from environment variables WANFANG_USERNAME and WANFANG_PASSWORD.
+    """
+    # Get credentials from environment
+    if username is None:
+        username = os.environ.get("WANFANG_USERNAME", "")
+    if password is None:
+        password = os.environ.get("WANFANG_PASSWORD", "")
+
+    if not username or not password:
+        logger.error("Missing WANFANG_USERNAME or WANFANG_PASSWORD in environment")
+        return False
+
+    try:
+        logger.info(f"Performing login with username: {username[:3]}***...")
+
+        # Fill username
+        username_input = page.locator('input[name="username"], input[type="text"], #username').first
+        if await username_input.count() > 0:
+            await username_input.fill(username)
+            logger.info("Filled username")
+
+        # Fill password
+        password_input = page.locator('input[name="password"], input[type="password"], #password').first
+        if await password_input.count() > 0:
+            await password_input.fill(password)
+            logger.info("Filled password")
+
+        await asyncio.sleep(0.5)
+
+        # Solve captcha if present
+        if await check_for_captcha(page):
+            await solve_slider_captcha(browser)
+            await asyncio.sleep(1)
+
+        # Click login button
+        login_btn = page.locator('button.btn-login, button:has-text("登录"), input[type="submit"]').first
+        if await login_btn.count() > 0:
+            await login_btn.click()
+            logger.info("Clicked login button")
+
+            # Wait for login to complete (page should redirect)
+            try:
+                await page.wait_for_url("**/Paper/**", timeout=10000)
+                logger.info("Login successful, redirected to search page")
+            except Exception:
+                # Fallback: wait and check if still on login page
+                await asyncio.sleep(3)
+                if not await is_login_page(page):
+                    logger.info("Login appears successful")
+                else:
+                    logger.warning("Still on login page after clicking login")
+
+        return True
+    except Exception as e:
+        logger.error(f"Login failed: {e}")
+        return False
+
+
 async def check_for_captcha(page) -> bool:
     """Check if captcha verification page is displayed."""
     try:
@@ -646,6 +737,28 @@ async def get_total_results(page) -> int:
     except Exception as e:
         logger.warning(f"Failed to get total results: {e}")
         return 0
+
+
+async def is_page_empty(page) -> bool:
+    """Check if current page has no results.
+
+    Detects empty page by:
+    1. "共 0 条" text
+    2. "抱歉，系统没有检索到相关记录" message
+    """
+    try:
+        return await page.evaluate("""
+            () => {
+                const text = document.body.innerText;
+                // Check for "共 0 条"
+                if (/共\\s*0\\s*条/.test(text)) return true;
+                // Check for "抱歉" + "没有检索到" message
+                if (text.includes('抱歉') && text.includes('没有检索到')) return true;
+                return false;
+            }
+        """)
+    except Exception:
+        return False
 
 
 async def select_page_size(page, size: str = "50") -> bool:
@@ -1083,46 +1196,142 @@ async def close_export_dialog(page) -> bool:
         return False
 
 
-async def clear_selection(page) -> bool:
-    """Clear current article selection."""
+async def get_selection_count(page) -> int:
+    """Get the current selection count from "已选 X/200" display."""
     try:
+        result = await page.evaluate("""
+            () => {
+                // Look for "已选 X/200" pattern
+                const text = document.body.innerText;
+                const match = text.match(/已选\\s*(\\d+)\\s*[/／]/);
+                if (match) {
+                    return parseInt(match[1], 10);
+                }
+                // Alternative: look for selection counter element
+                const counters = document.querySelectorAll('[class*="select"], [class*="count"], .batch-bar, .selection-bar');
+                for (const counter of counters) {
+                    const m = counter.textContent.match(/已选\\s*(\\d+)/);
+                    if (m) return parseInt(m[1], 10);
+                }
+                return -1;  // Not found
+            }
+        """)
+        return result
+    except Exception as e:
+        logger.debug(f"Could not get selection count: {e}")
+        return -1
+
+
+async def clear_selection(page) -> bool:
+    """Clear current article selection.
+
+    This function will:
+    1. Check current selection count
+    2. Try multiple methods to click "清除" button
+    3. Verify that selection was actually cleared
+    """
+    try:
+        # First, check current selection count
+        before_count = await get_selection_count(page)
+        logger.info(f"Selection count before clear: {before_count}")
+
+        if before_count == 0:
+            logger.info("Selection already empty, no need to clear")
+            return True
+
+        # Method 1: Playwright selectors for "清除" button
         selectors = [
+            # Direct text match
             'text=清除',
+            # In a batch operation bar
+            '.batch-bar >> text=清除',
+            '.selection-bar >> text=清除',
+            '[class*="batch"] >> text=清除',
+            '[class*="select"] >> text=清除',
+            # Button/link elements
             'button:has-text("清除")',
-            '.clear-btn',
             'a:has-text("清除")',
+            'span:has-text("清除"):not(:has(*))',  # Leaf span nodes only
+            '.clear-btn',
+            '.clear-selection',
+            '[class*="clear"]',
         ]
 
+        clicked = False
         for selector in selectors:
             try:
                 elem = page.locator(selector).first
-                if await elem.count() > 0:
+                if await elem.count() > 0 and await elem.is_visible():
                     await elem.click()
-                    logger.info(f"Cleared selection: {selector}")
-                    return True
-            except Exception:
+                    logger.info(f"Clicked clear button: {selector}")
+                    clicked = True
+                    break
+            except Exception as e:
+                logger.debug(f"Selector {selector} failed: {e}")
                 continue
 
-        # Fallback: JavaScript
-        result = await page.evaluate("""
-            () => {
-                const elements = document.querySelectorAll('button, a, span');
-                for (const el of elements) {
-                    if (el.textContent && el.textContent.trim() === '清除') {
-                        el.click();
-                        return true;
+        # Method 2: JavaScript click with more precise targeting
+        if not clicked:
+            result = await page.evaluate("""
+                () => {
+                    // Look for "清除" in the batch operation bar
+                    const batchBars = document.querySelectorAll('.batch-bar, .selection-bar, [class*="batch"], [class*="action"], .result-header, .toolbar');
+                    for (const bar of batchBars) {
+                        const clearBtn = Array.from(bar.querySelectorAll('a, button, span')).find(
+                            el => el.textContent && el.textContent.trim() === '清除'
+                        );
+                        if (clearBtn) {
+                            clearBtn.click();
+                            return {success: true, location: 'batch-bar'};
+                        }
                     }
+
+                    // Fallback: find any "清除" text that's clickable
+                    const allElements = document.querySelectorAll('a, button, span, div');
+                    for (const el of allElements) {
+                        if (el.textContent && el.textContent.trim() === '清除') {
+                            // Check if it's a leaf node or has click handler
+                            if (el.children.length === 0 || el.onclick || el.tagName === 'A' || el.tagName === 'BUTTON') {
+                                el.click();
+                                return {success: true, location: 'generic'};
+                            }
+                        }
+                    }
+
+                    return {success: false, location: null};
                 }
-                return false;
-            }
-        """)
+            """)
 
-        if result:
-            logger.info("Cleared selection via JavaScript")
+            if result and result.get('success'):
+                logger.info(f"Cleared selection via JavaScript ({result.get('location')})")
+                clicked = True
+
+        if not clicked:
+            logger.warning("Could not find clear button on page")
+            # Try pressing Escape to close any dialogs that might be blocking
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.2)
+            return False
+
+        # Wait for clear action to take effect
+        await asyncio.sleep(0.5)
+
+        # Verify that selection was cleared
+        after_count = await get_selection_count(page)
+        logger.info(f"Selection count after clear: {after_count}")
+
+        if after_count == 0:
+            logger.info("Selection successfully cleared!")
             return True
-
-        logger.warning("Could not find clear button")
-        return False
+        elif after_count > 0 and after_count < before_count:
+            logger.warning(f"Selection partially cleared: {before_count} -> {after_count}")
+            return False
+        elif after_count == before_count:
+            logger.warning(f"Clear did not work, count still {after_count}")
+            return False
+        else:
+            # after_count is -1 (couldn't read) - assume success if we clicked
+            return True
 
     except Exception as e:
         logger.warning(f"Failed to clear selection: {e}")
@@ -1222,25 +1431,37 @@ async def go_to_next_page(page) -> bool:
         return False
 
 
-async def export_search_results(browser: BrowserController, export_dir: str, max_articles: int = 0) -> int:
-    """Export all search results by going through every page.
+async def export_search_results(
+    browser: BrowserController,
+    export_dir: str,
+    max_articles: int = 0,
+    query: str = "",
+    start_year: str = "2019",
+    end_year: str = None,
+    resource_type: str = "chinese",
+) -> int:
+    """Export all search results using URL-based pagination.
 
-    Simple workflow (filtering already done on search page):
-    1. Set page size to 50
-    2. On each page: select all → export → clear
-    3. Go to next page, repeat until last page
+    Simple workflow:
+    1. Build base URL with search parameters
+    2. For each page: navigate to URL with p=N → select all → export
+    3. Merge all batch files
 
     Args:
         browser: BrowserController instance
         export_dir: Directory to save exported files
         max_articles: Maximum articles to export (0 = unlimited)
+        query: Search query for URL building
+        start_year: Start year filter
+        end_year: End year filter
+        resource_type: Resource type filter
 
     Returns:
         Total number of articles exported
     """
     page = browser.page
 
-    # Get total results (filtering already done on search page)
+    # Get total results from current page
     total = await get_total_results(page)
     print(f"   Total results: {total}")
 
@@ -1253,99 +1474,110 @@ async def export_search_results(browser: BrowserController, export_dir: str, max
         total = min(total, max_articles)
         print(f"   Limited to {max_articles} articles")
 
-    # Step 3: Select 50 per page
-    print("   Setting page size to 50...")
-    await select_page_size(page, "50")
-    await asyncio.sleep(1)
-
-    # Save the search results URL to return to after export
-    search_results_url = page.url
-    print(f"   Search results URL: {search_results_url}")
-
     exported = 0
     current_page = 1
     articles_per_page = 50
 
     # Calculate total pages
     total_pages = (total + articles_per_page - 1) // articles_per_page
-    print(f"   Total pages to export: ~{total_pages}")
+    print(f"   Total pages to export: {total_pages}")
 
-    # Keep going through pages until the last one
+    # Export each page using URL-based pagination
     while current_page <= total_pages:
-        # Wait for page content to be ready (wait for article list to appear)
+        # Build URL for current page
+        page_url = build_search_url(
+            query=query,
+            start_year=start_year,
+            end_year=end_year,
+            resource_type=resource_type,
+            page=current_page,
+            per_page=articles_per_page,
+        )
+
+        # Navigate to the page (skip for page 1 if already there)
+        if current_page > 1:
+            print(f"   [Page {current_page}/{total_pages}] Navigating to page {current_page}...")
+            await browser.navigate(page_url)
+            await asyncio.sleep(1.5)
+
+            # Check if redirected to login page
+            if await is_login_page(page):
+                print(f"   [!] Login page detected, performing login...")
+                await perform_page_login(browser, page)
+                # Navigate back to the search page after login
+                await browser.navigate(page_url)
+                await asyncio.sleep(1.5)
+            # Check for captcha after navigation
+            elif await check_for_captcha(page):
+                print(f"   [!] Captcha detected, solving...")
+                await solve_slider_captcha(browser)
+                await asyncio.sleep(1)
+
+        # Wait for content to load
         try:
             await page.wait_for_selector('.paper-list, .result-list, [class*="paper"], [class*="result"]', timeout=5000)
         except Exception:
-            pass  # Continue even if selector not found
+            pass
 
-        # Verify we're on the correct page by checking the current page number
-        actual_page = await page.evaluate("""
-            () => {
-                // Find the active/current page number button
-                const activeBtn = document.querySelector('button[style*="background"], .active, [class*="current"], [class*="active"]');
-                if (activeBtn) {
-                    const num = parseInt(activeBtn.textContent, 10);
-                    if (!isNaN(num)) return num;
-                }
-                // Try finding by different method - highlighted pagination number
-                const pageBtns = document.querySelectorAll('.pagination button, .page-list button, [class*="page"] button');
-                for (const btn of pageBtns) {
-                    const style = window.getComputedStyle(btn);
-                    if (style.backgroundColor !== 'rgba(0, 0, 0, 0)' && style.backgroundColor !== 'transparent') {
-                        const num = parseInt(btn.textContent, 10);
-                        if (!isNaN(num)) return num;
-                    }
-                }
-                return 1;
-            }
-        """)
-        print(f"   [Page {current_page}/{total_pages}] Current page detected: {actual_page}")
+        # Check if page is empty (no results)
+        if await is_page_empty(page):
+            print(f"   [Page {current_page}/{total_pages}] Page is empty, stopping pagination")
+            break
 
-        print(f"   [Page {current_page}/{total_pages}] Selecting all articles...")
+        # Step 1: Clear selection first (important: max 200 selection limit)
+        # Check selection count before clearing
+        selection_count = await get_selection_count(page)
+        if selection_count > 0:
+            print(f"   [Page {current_page}/{total_pages}] Step 1: Clearing {selection_count} selected items...")
+        else:
+            print(f"   [Page {current_page}/{total_pages}] Step 1: Checking selection status...")
+
+        clear_success = await clear_selection(page)
+
+        # Retry clear if it failed and there were selections
+        if not clear_success and selection_count > 0:
+            print(f"   [Page {current_page}/{total_pages}] Retrying clear...")
+            await asyncio.sleep(0.5)
+            # Try refreshing the page to reset selection state
+            await browser.navigate(page_url)
+            await asyncio.sleep(1)
+            # Try clear again
+            clear_success = await clear_selection(page)
+            if not clear_success:
+                print(f"   [!] Warning: Could not clear selection, may hit 200 limit")
+
+        await asyncio.sleep(0.3)
+
+        # Step 2: Select all articles on this page
+        print(f"   [Page {current_page}/{total_pages}] Step 2: Selecting all articles...")
         await select_all_articles(page)
+        await asyncio.sleep(0.3)
 
-        # Export this page
-        print(f"   [Page {current_page}/{total_pages}] Opening export dialog...")
+        # Verify selection count after selecting
+        new_count = await get_selection_count(page)
+        if new_count > 0:
+            print(f"   [Page {current_page}/{total_pages}] Selected {new_count} articles")
+
+        # Step 3: Export this page
+        print(f"   [Page {current_page}/{total_pages}] Step 3: Opening export dialog...")
         await click_reference_export(page)
 
         print(f"   [Page {current_page}/{total_pages}] Exporting to Excel...")
         file_path = await export_to_excel(browser, export_dir, current_page)
 
         if file_path:
-            # Estimate articles on this page
             remaining = total - exported
             articles_this_page = min(articles_per_page, remaining)
             exported += articles_this_page
             print(f"   [Page {current_page}/{total_pages}] Saved: {file_path} (~{articles_this_page} articles)")
         else:
-            print(f"   [Page {current_page}/{total_pages}] Warning: Export failed, continuing to next page...")
+            print(f"   [Page {current_page}/{total_pages}] Warning: Export failed")
 
         # Check if we're done
         if current_page >= total_pages:
             print(f"   Reached last page (page {current_page})")
             break
 
-        # IMPORTANT: Do NOT navigate back to search_results_url as it resets to page 1
-        # Instead, just close the export dialog and stay on the current page
-        # The close_export_dialog function should handle this properly
-
-        # Clear selection before going to next page
-        print(f"   [Page {current_page}/{total_pages}] Clearing selection...")
-        await clear_selection(page)
-
-        # Go to next page FIRST, then loop back to export
-        print(f"   [Page {current_page}/{total_pages}] Going to next page...")
-        has_next = await go_to_next_page(page)
-
-        if not has_next:
-            print(f"   No more pages available (stopped at page {current_page})")
-            break
-
-        # Wait for new page content to load (network idle or timeout)
-        try:
-            await page.wait_for_load_state('networkidle', timeout=5000)
-        except Exception:
-            await asyncio.sleep(0.5)  # Fallback short wait
         current_page += 1
 
     print(f"   Export complete: ~{exported} articles across {current_page} page(s)")

@@ -178,7 +178,10 @@
 
       <!-- Results Card -->
       <div class="card" id="results-card" style="display: none;">
-        <div class="label">分类结果</div>
+        <div class="label" style="display: flex; justify-content: space-between; align-items: center;">
+          <span>分类结果</span>
+          <button id="download-btn" class="download-btn" onclick="downloadResults()">下载 CSV</button>
+        </div>
         <div id="results-summary" class="results-summary"></div>
         <div id="results"></div>
       </div>
