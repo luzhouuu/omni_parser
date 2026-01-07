@@ -250,7 +250,7 @@ function renderResults(results) {
             { label: "患者模式", value: patientDisplay, evidence: patientEvidence, isText: true },
         ];
 
-        // Rule logic
+        // Rule logic (根据专家反馈修订 v2)
         const ruleLogic = label === 'Rejection'
             ? `<code>无drug 或 (无AE 且 无特殊情况)</code> → <span class="pill bad">Rejection</span>`
             : label === 'ICSR'
@@ -259,7 +259,7 @@ function renderResults(results) {
             ? `<code>drug + (特殊情况 或 (AE+因果关系)) + 多患者</code> → <span class="pill info">Multiple</span>`
             : label === 'ICSR+Multiple_Patients'
             ? `<code>drug + (特殊情况 或 (AE+因果关系)) + 混合患者</code> → <span class="pill warn">Mixed</span>`
-            : `<code>drug + (AE或特殊情况) + 缺少因果/患者信息</code> → <span class="pill warn">Signal</span>`;
+            : `<code>drug + (AE或特殊情况) + 缺少因果/患者信息 → 有风险</code> → <span class="pill warn">Signal</span>`;
 
         return `
             <tr>

@@ -883,203 +883,177 @@ async def select_all_articles(page) -> bool:
 
 
 async def click_reference_export(page) -> bool:
-    """Click '批量导出' then select '参考文献' from dropdown menu."""
+    """Click '批量导出' to open export dialog or navigate to export page.
+
+    The Wanfang UI may vary - sometimes it opens a dialog, sometimes it navigates.
+    """
     try:
-        # Step 1: Click or hover on '批量导出' to show dropdown
-        batch_export_selectors = [
+        # Try Playwright selector first for better reliability
+        selectors = [
             'text=批量导出',
             'button:has-text("批量导出")',
             'a:has-text("批量导出")',
             'span:has-text("批量导出")',
         ]
 
-        clicked_batch = False
-        for selector in batch_export_selectors:
+        clicked = False
+        for selector in selectors:
             try:
                 elem = page.locator(selector).first
                 if await elem.count() > 0:
-                    await elem.hover()  # Hover to show dropdown
+                    # Hover first to ensure visibility
+                    await elem.hover()
+                    await asyncio.sleep(0.1)
                     await elem.click()
                     logger.info(f"Clicked batch export button: {selector}")
-                    clicked_batch = True
+                    clicked = True
                     break
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Selector {selector} failed: {e}")
                 continue
 
-        if not clicked_batch:
-            # Try JavaScript
+        if not clicked:
+            # Fallback: JavaScript
             result = await page.evaluate("""
                 () => {
-                    const elements = document.querySelectorAll('*');
+                    const elements = document.querySelectorAll('button, a, span, div');
                     for (const el of elements) {
-                        if (el.textContent && el.textContent.trim() === '批量导出') {
+                        const text = (el.textContent || '').trim();
+                        if (text === '批量导出') {
                             el.click();
-                            return true;
+                            return 'exact';
                         }
                     }
-                    return false;
+                    for (const el of elements) {
+                        const text = (el.textContent || '').trim();
+                        if (text.includes('批量导出')) {
+                            el.click();
+                            return 'contains';
+                        }
+                    }
+                    return null;
                 }
             """)
             if result:
-                clicked_batch = True
-                logger.info("Clicked batch export via JavaScript")
+                logger.info(f"Clicked batch export via JavaScript: {result}")
+                clicked = True
 
-        if not clicked_batch:
-            logger.warning("Could not find batch export button")
-            return False
-
-        # Step 2: Wait for dropdown menu to appear, then click '参考文献'
-        ref_selectors = [
-            'text=参考文献',
-            'a:has-text("参考文献")',
-            'li:has-text("参考文献")',
-            'div:has-text("参考文献")',
-        ]
-
-        # Wait for dropdown item to be visible
-        for selector in ref_selectors:
-            try:
-                elem = page.locator(selector).first
-                await elem.wait_for(state='visible', timeout=3000)
-                break
-            except Exception:
-                continue
-
-        for selector in ref_selectors:
-            try:
-                # Get all matching elements and find the one in dropdown (not the main button)
-                elems = page.locator(selector)
-                count = await elems.count()
-                for i in range(count):
-                    elem = elems.nth(i)
-                    text = await elem.text_content()
-                    # Make sure it's exactly "参考文献" not "批量导出" containing it
-                    if text and text.strip() == '参考文献':
-                        await elem.click()
-                        logger.info(f"Clicked reference export option: {selector}")
-                        return True
-            except Exception:
-                continue
-
-        # Fallback: JavaScript
-        result = await page.evaluate("""
-            () => {
-                const elements = document.querySelectorAll('a, li, div, span');
-                for (const el of elements) {
-                    if (el.textContent && el.textContent.trim() === '参考文献') {
-                        el.click();
-                        return true;
-                    }
-                }
-                return false;
-            }
-        """)
-
-        if result:
-            logger.info("Clicked reference option via JavaScript")
+        if clicked:
+            # Wait for UI response - either dialog or page change
+            await asyncio.sleep(random.uniform(1.5, 2.5))  # 模拟真人点击后等待
             return True
 
-        logger.warning("Could not find reference option in dropdown")
+        logger.warning("Could not find batch export button")
         return False
 
     except Exception as e:
-        logger.warning(f"Failed to click reference export: {e}")
+        logger.warning(f"Failed to click batch export: {e}")
         return False
 
 
 async def export_to_excel(browser: BrowserController, export_dir: str, batch_num: int) -> str:
-    """Click '导出到Excel' and download the file."""
+    """Click '导出到Excel' and download the file.
+
+    Optimized version: Wait for dialog, then use JavaScript click with expect_download.
+    """
     import os
 
     page = browser.page
 
     # Ensure export directory exists
     os.makedirs(export_dir, exist_ok=True)
+    download_path = f"/tmp/browser_agent_screenshots/downloads/wanfang_export_batch_{batch_num}.xlsx"
 
     try:
-        # Wait for export dialog to appear (wait for Excel button to be visible)
-        selectors = [
-            'text=导出到Excel',
-            'text=导出Excel',
-            'text=导出至Excel',
-            'button:has-text("Excel")',
-            'a:has-text("Excel")',
-            'span:has-text("导出到Excel")',
-            'div:has-text("导出到Excel")',
-        ]
+        # Wait briefly for export dialog to appear after clicking 批量导出
+        await asyncio.sleep(0.5)
 
-        # Wait for any Excel button to appear
-        for selector in selectors:
-            try:
-                elem = page.locator(selector).first
-                await elem.wait_for(state='visible', timeout=3000)
-                break
-            except Exception:
-                continue
-
-        for selector in selectors:
-            try:
-                elem = page.locator(selector).first
-                if await elem.count() > 0:
-                    # Handle download with Playwright's expect_download
-                    async def click_export():
-                        await elem.click()
-                        # Check for and dismiss any alert dialog (like "导出记录数量超额")
-                        await dismiss_export_alert(page)
-
-                    file_path = await browser.handle_download(
-                        click_export,
-                        save_as=f"wanfang_export_batch_{batch_num}.xlsx"
-                    )
-                    logger.info(f"Exported to: {file_path}")
-
-                    # Close the export dialog after download
-                    await close_export_dialog(page)
-
-                    return file_path
-            except Exception as e:
-                logger.debug(f"Selector {selector} failed: {e}")
-                continue
-
-        # Fallback: Try JavaScript click with download handling
-        async with page.expect_download(timeout=30000) as download_info:
-            result = await page.evaluate("""
+        # Set up download handler and click Excel button
+        async with page.expect_download(timeout=20000) as download_info:
+            # Use JavaScript to find and click Excel button
+            clicked = await page.evaluate("""
                 () => {
-                    // Look for Excel export button in any element
-                    const elements = document.querySelectorAll('button, a, span, div, li');
-                    for (const el of elements) {
-                        const text = el.textContent || '';
-                        if (text.includes('导出到Excel') || text.includes('导出Excel') ||
-                            text.includes('导出至Excel') || (text.includes('Excel') && text.includes('导出'))) {
-                            el.click();
-                            return true;
+                    // Priority order: look for Excel export buttons (MUST contain "Excel")
+                    const patterns = ['导出到Excel', '导出Excel', '导出至Excel'];
+                    const elements = document.querySelectorAll('button, a, span, div, li, input');
+
+                    // First pass: exact matches
+                    for (const pattern of patterns) {
+                        for (const el of elements) {
+                            const text = (el.textContent || '').trim();
+                            if (text === pattern) {
+                                if (el.offsetParent !== null) {
+                                    el.click();
+                                    return 'exact:' + pattern;
+                                }
+                            }
                         }
                     }
-                    // Try finding by class or other attributes
-                    const excelBtn = document.querySelector('[class*="excel"], [class*="export"]');
-                    if (excelBtn && excelBtn.textContent.includes('Excel')) {
-                        excelBtn.click();
-                        return true;
+
+                    // Second pass: contains pattern
+                    for (const pattern of patterns) {
+                        for (const el of elements) {
+                            const text = (el.textContent || '').trim();
+                            if (text.includes(pattern)) {
+                                if (el.offsetParent !== null) {
+                                    el.click();
+                                    return 'contains:' + pattern;
+                                }
+                            }
+                        }
                     }
-                    return false;
+
+                    // Third pass: any element with "Excel" (case insensitive)
+                    for (const el of elements) {
+                        const text = (el.textContent || '').trim();
+                        if (text.toLowerCase().includes('excel') && el.offsetParent !== null) {
+                            el.click();
+                            return 'excel:' + text.substring(0, 30);
+                        }
+                    }
+
+                    return null;
                 }
             """)
-            # Check for and dismiss any alert dialog (like "导出记录数量超额")
+
+            if clicked:
+                logger.info(f"Clicked Excel export button: {clicked}")
+            else:
+                logger.warning("Could not find Excel export button via JavaScript")
+                # Try Playwright selectors as backup
+                selectors = [
+                    'text=导出到Excel',
+                    'text=导出Excel',
+                    'button:has-text("Excel")',
+                    'a:has-text("Excel")',
+                ]
+                for selector in selectors:
+                    try:
+                        elem = page.locator(selector).first
+                        if await elem.count() > 0 and await elem.is_visible():
+                            await elem.click()
+                            logger.info(f"Clicked Excel button via Playwright: {selector}")
+                            break
+                    except Exception:
+                        continue
+
+            # Dismiss any alert that might appear
             await dismiss_export_alert(page)
 
-        if result:
-            download = await download_info.value
-            download_path = f"/tmp/browser_agent_screenshots/downloads/wanfang_export_batch_{batch_num}.xlsx"
-            await download.save_as(download_path)
-            logger.info(f"Clicked Excel export via JavaScript, saved to: {download_path}")
-            await close_export_dialog(page)
-            return download_path
+        # Wait for download to complete
+        download = await download_info.value
+        await download.save_as(download_path)
+        logger.info(f"Exported to: {download_path}")
 
-        logger.warning("Could not find Excel export button")
-        return ""
+        # Close dialog
+        await close_export_dialog(page)
+
+        return download_path
 
     except Exception as e:
         logger.warning(f"Failed to export to Excel: {e}")
+        # Try to close any open dialog
+        await page.keyboard.press("Escape")
         return ""
 
 
@@ -1090,7 +1064,7 @@ async def dismiss_export_alert(page) -> bool:
     We need to click '确定' to acknowledge and continue.
     """
     try:
-        await asyncio.sleep(0.5)  # Brief wait for dialog to appear
+        await asyncio.sleep(0.1)  # Brief wait for dialog to appear (reduced from 0.5s)
 
         # Look for the confirm button in the alert dialog
         confirm_selectors = [
@@ -1110,7 +1084,7 @@ async def dismiss_export_alert(page) -> bool:
                 if await elem.count() > 0 and await elem.is_visible():
                     await elem.click()
                     logger.info(f"Dismissed export alert dialog: {selector}")
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.1)  # Reduced from 0.3s
                     return True
             except Exception:
                 continue
@@ -1137,7 +1111,7 @@ async def dismiss_export_alert(page) -> bool:
 
         if result:
             logger.info("Dismissed export alert via JavaScript")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)  # Reduced from 0.3s
             return True
 
         return False
@@ -1154,8 +1128,8 @@ async def close_export_dialog(page) -> bool:
     as we need to preserve the current pagination state.
     """
     try:
-        # First, try to dismiss any alert dialog (like "导出记录数量超额")
-        await dismiss_export_alert(page)
+        # NOTE: Removed redundant dismiss_export_alert() call here
+        # export_to_excel() already calls it before download
 
         # Try to close any modal/dialog
         close_selectors = [
@@ -1498,7 +1472,7 @@ async def export_search_results(
         if current_page > 1:
             print(f"   [Page {current_page}/{total_pages}] Navigating to page {current_page}...")
             await browser.navigate(page_url)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(random.uniform(2.0, 3.5))  # 增加延迟，模拟真人
 
             # Check if redirected to login page
             if await is_login_page(page):
@@ -1506,16 +1480,16 @@ async def export_search_results(
                 await perform_page_login(browser, page)
                 # Navigate back to the search page after login
                 await browser.navigate(page_url)
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(random.uniform(2.0, 3.5))  # 增加延迟
             # Check for captcha after navigation
             elif await check_for_captcha(page):
                 print(f"   [!] Captcha detected, solving...")
                 await solve_slider_captcha(browser)
-                await asyncio.sleep(1)
+                await asyncio.sleep(random.uniform(1.5, 2.5))  # 增加延迟
 
         # Wait for content to load
         try:
-            await page.wait_for_selector('.paper-list, .result-list, [class*="paper"], [class*="result"]', timeout=5000)
+            await page.wait_for_selector('.paper-list, .result-list, [class*="paper"], [class*="result"]', timeout=3000)  # Reduced from 5000ms
         except Exception:
             pass
 
@@ -1537,21 +1511,21 @@ async def export_search_results(
         # Retry clear if it failed and there were selections
         if not clear_success and selection_count > 0:
             print(f"   [Page {current_page}/{total_pages}] Retrying clear...")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.2)  # Reduced from 0.5s
             # Try refreshing the page to reset selection state
             await browser.navigate(page_url)
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)  # Reduced from 1s
             # Try clear again
             clear_success = await clear_selection(page)
             if not clear_success:
                 print(f"   [!] Warning: Could not clear selection, may hit 200 limit")
 
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(random.uniform(0.8, 1.5))  # 模拟真人操作间隔
 
         # Step 2: Select all articles on this page
         print(f"   [Page {current_page}/{total_pages}] Step 2: Selecting all articles...")
         await select_all_articles(page)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(random.uniform(0.8, 1.5))  # 模拟真人操作间隔
 
         # Verify selection count after selecting
         new_count = await get_selection_count(page)

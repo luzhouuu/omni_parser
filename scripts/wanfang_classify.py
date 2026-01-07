@@ -158,6 +158,309 @@ def truncate_text(text: str, max_chars: int = 45000) -> str:
     return text[:head] + "\n\n[...truncated...]\n\n" + text[-tail:]
 
 
+def extract_target_drug_from_filename(filename: str) -> str | None:
+    """从文件名前缀提取目标药物名称。
+
+    根据专家反馈，PDF文件名格式通常为: "药物名-文章标题.pdf"
+    文件名前缀（第一个"-"之前的部分）即为该文献的目标监测药物。
+
+    Args:
+        filename: PDF文件名
+
+    Returns:
+        目标药物名称，如果无法提取则返回None
+    """
+    if not filename:
+        return None
+
+    # 去除扩展名
+    name = filename.rsplit('.', 1)[0] if '.' in filename else filename
+
+    # 按第一个 "-" 分割，取前缀作为目标药物
+    if '-' in name:
+        target_drug = name.split('-', 1)[0].strip()
+        if target_drug:
+            return target_drug
+
+    return None
+
+
+import re
+
+
+def search_drug_in_text(text: str, target_drug: str, drug_keywords: list[str]) -> dict:
+    """在全文中搜索目标药物，返回搜索结果和上下文。
+
+    Args:
+        text: 文章全文
+        target_drug: 目标药物名称（从文件名提取）
+        drug_keywords: 药物关键词列表（包含别名）
+
+    Returns:
+        dict: {
+            'found': bool,  # 是否找到
+            'count': int,   # 出现次数
+            'matched_terms': list[str],  # 匹配到的具体词
+            'contexts': list[str],  # 上下文片段（最多5个）
+            'search_terms': list[str],  # 搜索的关键词
+        }
+    """
+    if not text or not target_drug:
+        return {
+            'found': False, 'count': 0, 'matched_terms': [],
+            'contexts': [], 'search_terms': []
+        }
+
+    # 构建搜索词列表：目标药物 + 相关别名
+    search_terms = [target_drug.lower()]
+
+    # 从药物关键词列表中找相关别名
+    target_lower = target_drug.lower()
+    for kw in drug_keywords:
+        kw_lower = kw.lower()
+        # 如果关键词包含目标药物或目标药物包含关键词
+        if target_lower in kw_lower or kw_lower in target_lower:
+            if kw_lower not in search_terms:
+                search_terms.append(kw_lower)
+        # 常见药物别名映射
+        drug_aliases = {
+            '卡马西平': ['carbamazepine', 'tegretol', '得理多'],
+            '奥卡西平': ['oxcarbazepine', 'trileptal', '曲莱'],
+            '缬沙坦': ['valsartan', '代文'],
+            '来曲唑': ['letrozole', '芙瑞'],
+            '环孢素': ['cyclosporine', 'ciclosporin', '新山地明', 'sandimmun'],
+            '布林佐胺': ['brinzolamide', '派立明'],
+            '司库奇尤单抗': ['secukinumab', '可善挺', 'cosentyx'],
+            '妥布霉素': ['tobramycin', '托百士'],
+            '雷珠单抗': ['ranibizumab', '诺适得', 'lucentis'],
+            '沙库巴曲缬沙坦': ['sacubitril/valsartan', '诺欣妥', 'entresto'],
+            '甲磺酸伊马替尼': ['imatinib', '格列卫', 'gleevec', 'glivec'],
+            '伊马替尼': ['imatinib', '格列卫', 'gleevec', 'glivec'],
+            'octreotide': ['奥曲肽', '善龙', 'sandostatin'],
+            'pazopanib': ['帕唑帕尼', '维全特', 'votrient'],
+        }
+        for main_name, aliases in drug_aliases.items():
+            if target_lower == main_name.lower() or target_lower in [a.lower() for a in aliases]:
+                for alias in aliases:
+                    if alias.lower() not in search_terms:
+                        search_terms.append(alias.lower())
+                if main_name.lower() not in search_terms:
+                    search_terms.append(main_name.lower())
+
+    # 在文本中搜索
+    text_lower = text.lower()
+    # 创建去除空格的版本（处理OCR空格问题，如"卡 马 西 平"）
+    text_no_space = re.sub(r'\s+', '', text_lower)
+
+    matched_terms = []
+    all_positions = []
+
+    for term in search_terms:
+        term_lower = term.lower()
+        term_no_space = re.sub(r'\s+', '', term_lower)
+
+        # 方法1: 直接匹配（原文本）
+        pattern = re.escape(term_lower)
+        matches = list(re.finditer(pattern, text_lower))
+        if matches:
+            matched_terms.append(term)
+            for m in matches:
+                all_positions.append((m.start(), m.end(), term))
+
+        # 方法2: 去空格后匹配（处理OCR问题）
+        if not matches and len(term_no_space) >= 2:
+            # 在去空格的文本中搜索
+            pattern_no_space = re.escape(term_no_space)
+            matches_no_space = list(re.finditer(pattern_no_space, text_no_space))
+            if matches_no_space:
+                matched_terms.append(f"{term}(OCR修正)")
+                # 估算原文位置（不精确但足够）
+                for m in matches_no_space:
+                    # 使用去空格位置的1.5倍作为估算
+                    est_pos = int(m.start() * 1.5)
+                    all_positions.append((est_pos, est_pos + len(term), term))
+
+        # 方法3: 允许字符间有空格的模式（如"卡 马 西 平"）
+        if not matches and len(term_lower) >= 2:
+            # 构建允许空格的正则：卡\s*马\s*西\s*平
+            spaced_pattern = r'\s*'.join(re.escape(c) for c in term_lower)
+            matches_spaced = list(re.finditer(spaced_pattern, text_lower))
+            if matches_spaced:
+                if term not in matched_terms and f"{term}(OCR修正)" not in matched_terms:
+                    matched_terms.append(f"{term}(空格)")
+                for m in matches_spaced:
+                    all_positions.append((m.start(), m.end(), term))
+
+    # 去重并排序位置
+    all_positions = sorted(set(all_positions), key=lambda x: x[0])
+
+    # 提取上下文（前后各50个字符）
+    contexts = []
+    used_ranges = []
+    for start, end, term in all_positions[:10]:  # 最多处理10个匹配
+        # 避免重叠的上下文
+        overlap = False
+        for used_start, used_end in used_ranges:
+            if not (end + 50 < used_start or start - 50 > used_end):
+                overlap = True
+                break
+        if overlap:
+            continue
+
+        ctx_start = max(0, start - 50)
+        ctx_end = min(len(text), end + 50)
+        context = text[ctx_start:ctx_end].replace('\n', ' ').strip()
+        # 标记匹配词
+        context = f"...{context}..."
+        contexts.append(context)
+        used_ranges.append((ctx_start, ctx_end))
+
+        if len(contexts) >= 5:
+            break
+
+    return {
+        'found': len(matched_terms) > 0,
+        'count': len(all_positions),
+        'matched_terms': list(set(matched_terms)),
+        'contexts': contexts,
+        'search_terms': search_terms[:10],  # 只返回前10个搜索词
+    }
+
+
+# 文章类型常量
+ARTICLE_TYPES = {
+    'animal_study': '动物实验',
+    'case_report': '病例报告',
+    'review': '综述/指南',
+    'clinical_study': '临床研究',
+    'unknown': '未知类型',
+}
+
+
+def detect_article_type(text: str, filename: str) -> dict:
+    """基于关键词检测文章类型。
+
+    Args:
+        text: 文章全文
+        filename: 文件名（用于提取标题）
+
+    Returns:
+        dict: {
+            'type': str,  # 文章类型代码
+            'type_cn': str,  # 文章类型中文
+            'confidence': float,  # 置信度
+            'evidence': list[str],  # 匹配到的关键词证据
+        }
+    """
+    if not text:
+        return {'type': 'unknown', 'type_cn': '未知类型', 'confidence': 0.0, 'evidence': []}
+
+    text_lower = text.lower()
+    # 提取标题（文件名中"-"后面的部分，或前2000字符）
+    title = filename.split('-', 1)[1] if '-' in filename else filename
+    title = title.rsplit('.', 1)[0] if '.' in title else title
+    title_lower = title.lower()
+
+    # 文章开头部分（更重要）
+    text_head = text_lower[:3000]
+
+    evidence = []
+    scores = {
+        'animal_study': 0,
+        'case_report': 0,
+        'review': 0,
+        'clinical_study': 0,
+    }
+
+    # ========== 动物实验检测 ==========
+    animal_keywords = {
+        '小鼠': 3, '大鼠': 3, 'mice': 3, 'mouse': 3, 'rat': 3, 'rats': 3,
+        '实验动物': 3, '动物实验': 3, '动物模型': 3, 'animal model': 3,
+        '造模': 2, '模型组': 2, '实验组大鼠': 3, '实验组小鼠': 3,
+        '灌胃': 2, '腹腔注射': 2, '尾静脉': 2,
+        '兔': 1, '豚鼠': 2, '犬': 1,
+    }
+    for kw, score in animal_keywords.items():
+        # 检查去空格版本（处理OCR问题）
+        kw_no_space = kw.replace(' ', '')
+        text_no_space = re.sub(r'\s+', '', text_lower)
+        if kw in text_lower or kw_no_space in text_no_space:
+            scores['animal_study'] += score
+            evidence.append(f"动物实验:{kw}")
+
+    # 如果有"患者"出现在前2000字符，降低动物实验得分
+    if '患者' in text_head or 'patient' in text_head:
+        scores['animal_study'] = max(0, scores['animal_study'] - 3)
+
+    # ========== 病例报告检测 ==========
+    case_keywords = {
+        '1例': 4, '一例': 4, '1 例': 4,
+        '个案': 3, '病例报告': 4, 'case report': 4,
+        '案例分享': 4, '病案分享': 4, '病案': 2,
+        '个例': 3, '单例': 3,
+    }
+    for kw, score in case_keywords.items():
+        if kw in title_lower:
+            scores['case_report'] += score + 2  # 标题中出现权重更高
+            evidence.append(f"病例报告(标题):{kw}")
+        elif kw in text_head:
+            scores['case_report'] += score
+            evidence.append(f"病例报告:{kw}")
+
+    # ========== 综述/指南检测 ==========
+    review_keywords = {
+        '综述': 4, '进展': 3, '研究进展': 4,
+        '指南': 4, 'guideline': 4, 'review': 3,
+        '专家共识': 4, '诊疗规范': 3, '诊治进展': 3,
+        '文献复习': 3, '系统评价': 3, 'meta分析': 3, 'meta-analysis': 3,
+    }
+    for kw, score in review_keywords.items():
+        if kw in title_lower:
+            scores['review'] += score + 2
+            evidence.append(f"综述(标题):{kw}")
+        elif kw in text_head:
+            scores['review'] += score
+            evidence.append(f"综述:{kw}")
+
+    # ========== 临床研究检测 ==========
+    clinical_keywords = {
+        '临床研究': 4, '临床试验': 4, 'clinical trial': 4, 'clinical study': 4,
+        '随机': 3, '对照组': 3, '观察组': 3, '治疗组': 3,
+        '纳入标准': 3, '排除标准': 3, '入组': 2,
+        '例患者': 3, '名患者': 3,
+        '回顾性分析': 3, '前瞻性': 3,
+        'n=': 2, 'p<': 2, 'p=': 2, 'p值': 2,
+    }
+    for kw, score in clinical_keywords.items():
+        if kw in text_lower:
+            scores['clinical_study'] += score
+            evidence.append(f"临床研究:{kw}")
+
+    # ========== 确定最终类型 ==========
+    max_score = max(scores.values())
+    if max_score < 3:
+        return {
+            'type': 'unknown',
+            'type_cn': '未知类型',
+            'confidence': 0.5,
+            'evidence': evidence[:5],
+        }
+
+    # 找出得分最高的类型
+    best_type = max(scores, key=scores.get)
+
+    # 计算置信度
+    total_score = sum(scores.values()) or 1
+    confidence = min(0.95, 0.5 + (scores[best_type] / total_score) * 0.5)
+
+    return {
+        'type': best_type,
+        'type_cn': ARTICLE_TYPES[best_type],
+        'confidence': round(confidence, 2),
+        'evidence': evidence[:5],
+    }
+
+
 def classify_by_rules(
     has_drug: bool,
     has_ae: bool,
@@ -167,19 +470,31 @@ def classify_by_rules(
 ) -> str:
     """Rule-based classification logic.
 
-    分类判断逻辑：
-    1. Rejection：文章中缺少drug(诺华药)或AE(不良事件)任意一个要素
-    2. ICSR：(drug+AE+因果关系+单个患者) OR (drug+特殊情况+单个患者)
-    3. Multiple_Patients：(drug+AE+因果关系+多个患者) OR (drug+特殊情况+多个患者)
+    分类判断逻辑（根据专家反馈修订 v2）：
+    1. Rejection：缺少drug，或者既无AE也无特殊情况（完全无安全监测价值）
+    2. ICSR：drug + (AE+因果关系 OR 特殊情况) + 单个患者
+    3. Multiple_Patients：drug + (AE+因果关系 OR 特殊情况) + 多个患者
     4. ICSR+Multiple_Patients：一篇文章同时满足ICSR和Multiple_Patients的条件
-    5. Other_Safety_Signal：不符合上面类型的都初筛成signal
+    5. Other_Safety_Signal：有drug且有AE/特殊情况，但缺少因果关系或患者信息（有风险，需关注）
+
+    关键修订：
+    - 特殊情况（儿童用药、药物无效等）可以独立构成安全信号，不需要AE
+    - 只有完全无安全价值才Rejection，有drug+AE/特殊情况至少是Signal
     """
-    # Rejection: 缺少 drug 或 AE 任意一个要素
-    if not has_drug or not has_ae:
+    # Rejection: 缺少药物
+    if not has_drug:
+        return "Rejection"
+
+    # 判断是否有安全信号价值：有AE或有特殊情况
+    has_safety_signal = has_ae or has_special_situation
+
+    # Rejection: 既无AE也无特殊情况（完全无安全监测价值）
+    if not has_safety_signal:
         return "Rejection"
 
     # 满足ICSR/Multiple_Patients的条件：
     # - (AE + 因果关系) OR 特殊情况
+    # 特殊情况（儿童用药、药物无效、妊娠暴露等）可以独立构成安全信号
     meets_criteria = (has_ae and has_causality) or has_special_situation
 
     if patient_mode == "single":
@@ -194,7 +509,7 @@ def classify_by_rules(
         # 混合(同时有单患者和多患者描述)：满足条件则ICSR+Multiple_Patients
         return "ICSR+Multiple_Patients" if meets_criteria else "Other_Safety_Signal"
 
-    # 其他情况（unknown等）都初筛成signal
+    # 其他情况（unknown等）：有drug+AE/特殊情况但缺少患者信息，仍有风险价值
     return "Other_Safety_Signal"
 
 
@@ -217,6 +532,16 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
     client = OpenAI(api_key=api_key)
     drug_hint = ", ".join(drug_keywords[:100]) if drug_keywords else "(未提供药物关键词)"
 
+    # 从文件名提取目标药物
+    target_drug = extract_target_drug_from_filename(filename)
+    target_drug_hint = f"【{target_drug}】" if target_drug else "(无法从文件名提取)"
+
+    # 文章类型检测
+    article_type_result = detect_article_type(text, filename)
+
+    # 全文搜索目标药物
+    drug_search_result = search_drug_in_text(text, target_drug, drug_keywords) if target_drug else None
+
     system_prompt = """你是一位资深的药物警戒信息提取专家。
 你的任务是从医学/科学文献中提取关键安全信息，用于诺华药物安全监测。
 
@@ -224,60 +549,151 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
 在全文范围内以中英文商品名&活性成分名作为关键词进行检索，检索出上抛到CNKI & Wanfang数据库中的文献。
 针对所有检索出来的文献进行审阅，识别文章中是否提及任何诺华药相关安全病例或潜在信号。
 
-分类判断逻辑：
-1. Rejection：文章中缺少drug(诺华药)或AE(不良事件)任意一个要素
-2. ICSR：(drug+AE+因果关系+单个患者) OR (drug+特殊情况+单个患者)
-3. Multiple_Patients：(drug+AE+因果关系+多个患者) OR (drug+特殊情况+多个患者)
+⚠️ 重要：目标药物判断规则（根据专家反馈修订）
+- PDF文件名格式为: "目标药物名-文章标题.pdf"
+- **文件名前缀（第一个"-"之前的部分）即为该文献的目标监测药物**
+- 即使文章内容主要讨论的是其他药物，只要文中提及了文件名前缀所示的目标药物，就应该判定has_drug=True
+- 例如: "卡马西平-左乙拉西坦致剥脱性皮炎.pdf" → 目标药物是"卡马西平"，不是"左乙拉西坦"
+
+分类判断逻辑（根据专家反馈修订 v2）：
+1. Rejection：缺少drug，或者既无AE也无特殊情况（完全无安全监测价值）
+2. ICSR：drug + (AE+因果关系 OR 特殊情况) + 单个患者
+3. Multiple_Patients：drug + (AE+因果关系 OR 特殊情况) + 多个患者
 4. ICSR+Multiple_Patients：一篇文章同时满足ICSR和Multiple_Patients的条件
-5. Other_Safety_Signal：不符合上面类型的都初筛成signal
+5. Other_Safety_Signal：有drug且有AE/特殊情况，但缺少因果关系或患者信息（有风险，需关注）
+
+关键修订：
+- 特殊情况（儿童用药、药物无效等）可以独立构成安全信号，不需要AE
+- 只有完全无安全价值才Rejection，有drug+AE/特殊情况至少是Signal
 
 需要提取的字段：
 
-1. **has_drug** (boolean): 文章是否提及目标诺华药物？
-   - 使用提供的药物关键词列表（中英文商品名、活性成分名）作为参考
-   - 注意：PDF文件名前缀通常包含对应的诺华产品名
+1. **has_drug** (boolean): 文章是否提及目标药物？
+   - ⚠️ 目标药物 = 文件名前缀（第一个"-"之前的部分）
+   - 在文章中搜索该目标药物的任何提及（中英文名、商品名、通用名均可）
+   - 即使只是简单提及或作为背景信息，也算has_drug=True
 
-2. **has_ae** (boolean): 是否描述了任何不良事件(AE)？
-   - 副作用、毒性反应、不良反应、安全事件
-   - 任何可能与药物使用相关的负面健康结果
+2. **has_ae** (boolean): 是否描述了与药物使用相关的不良事件(AE)？
+   - ✅ YES的情况：
+     - 病例报告/临床研究中描述的副作用、毒性反应、不良反应
+     - 患者用药后出现的负面健康结果（如：皮疹、出血、感染、器官损伤等）
+     - 临床试验中记录的不良反应发生率（如"不良反应发生率15%"）
+   - ❌ NO的情况：
+     - 纯粹描述疾病本身症状，与药物无关（如"高血压可导致心脏病"）
+     - 综述/指南中仅讨论疾病机制，未涉及药物不良反应
+     - 文章仅讨论药物疗效/机制，未提及任何负面事件
+   - ⚠️ 关键判断：文章中是否有"用药后/治疗期间出现的负面事件"描述
 
-3. **has_causality** (boolean): 是否有明确的因果关系表述将药物与事件联系起来？
-   - YES: "与...相关"、"由...引起"、"归因于"、"药物诱发"、"治疗相关"
-   - YES: "怀疑与...相关"、阳性再激发/去激发试验
-   - NO: 仅有时间关联而无归因
-   - NO: 否定陈述（"与...无关"、"不相关"）
-   - NO: 仅有人群统计数据而无个体归因
+3. **has_causality** (boolean): 是否有因果关系表述将药物与不良事件联系起来？
+   - ✅ YES的情况：
+     - 明确归因："与...相关"、"由...引起"、"归因于"、"药物诱发"、"导致"
+     - 时间关联+明确因果："用药后出现XX症状"、"治疗期间发生"、"停药后缓解"
+     - 去激发/再激发阳性
+     - 病例报告中明确描述药物引起的症状
+   - ❌ NO的情况：
+     - 综述/指南仅泛泛讨论药物可能的副作用（无具体病例）
+     - 仅是AE发生率统计，无具体因果描述
+     - 明确否定因果关系
+     - 仅描述疾病自然病程
+   - ⚠️ 需要有具体的因果描述，不是仅仅提及AE
 
-4. **has_special_situation** (boolean): 是否存在以下特殊情况？
+4. **has_special_situation** (boolean): 是否存在以下特殊情况？⚠️ 特殊情况可独立构成安全信号
    - 妊娠/哺乳期暴露 (Pregnancy/lactation exposure)
-   - 儿童用药 (Pediatric use - children, infants)
-   - 药物无效/疗效不佳 (Lack of efficacy/therapeutic failure)
+   - 儿童用药 (Pediatric use - 患者为儿童/婴幼儿)
+   - 药物无效/疗效不佳（需明确表述）："无效"、"治疗失败"、"未能控制"
    - 过量 (Overdose)
    - 用药错误 (Medication error)
    - 药物相互作用 (Drug-drug interaction)
    - 超说明书用药 (Off-label use)
+   - ❌ 注意：常规临床研究中的"联合用药"、"加量"不算特殊情况
 
 5. **patient_mode** (string): 患者识别
-   - "single": 单个可识别患者 (n=1, 病例报告, 有年龄/性别可判断单一患者存在, 或文章提到"1例")
-   - "multiple": 多个患者 (n>1, 作为队列描述)
-   - "mixed": 文章中同时存在单患者部分和多患者部分
-   - "unknown": 无明确患者信息或仅有汇总统计数据
+   - "single": 单个可识别患者（标题含"1例"、"个案"、"病例报告"，有明确的单一患者信息）
+   - "multiple": 多个患者（队列研究、临床试验、回顾性分析，有明确样本量）
+   - "mixed": 文章中既有单患者病例，又有多患者统计数据
+   - "unknown": 综述/指南，无明确患者信息
 
 仅返回包含这些字段和证据数组的JSON对象。"""
 
-    user_prompt = f"""目标诺华药物关键词（中英文商品名 & 活性成分名）:
-{drug_hint}
+    # 构建药物搜索结果提示
+    if drug_search_result and drug_search_result['found']:
+        drug_search_info = f"""
+📍 【全文检索结果】目标药物在文中出现情况：
+   - 检索状态: ✅ 找到
+   - 出现次数: {drug_search_result['count']}次
+   - 匹配词: {', '.join(drug_search_result['matched_terms'])}
+   - 上下文片段:
+"""
+        for i, ctx in enumerate(drug_search_result['contexts'][:3], 1):
+            drug_search_info += f"     [{i}] {ctx}\n"
+    elif drug_search_result:
+        drug_search_info = f"""
+📍 【全文检索结果】目标药物在文中出现情况：
+   - 检索状态: ❌ 未找到
+   - 搜索词: {', '.join(drug_search_result['search_terms'][:5])}
+   - ⚠️ 注意：全文检索未找到目标药物，请仔细核实文章内容
+"""
+    else:
+        drug_search_info = ""
+
+    # 构建文章类型提示
+    article_type_info = f"""
+📋 【文章类型检测】
+   - 检测结果: {article_type_result['type_cn']}
+   - 置信度: {article_type_result['confidence']}
+   - 证据: {', '.join(article_type_result['evidence'][:3]) if article_type_result['evidence'] else '无'}
+"""
+
+    # 根据文章类型生成特定的判断指导（柔和建议，不强制）
+    if article_type_result['type'] == 'animal_study':
+        type_specific_guidance = """
+💡 【仅供参考】规则检测提示本文可能是"动物实验"类型，但请以实际内容为准：
+   - 纯动物实验（药物仅用于造模）通常不含人体安全信息
+   - 但如果文章同时讨论了人体安全性数据、已知AE等，仍可能有价值
+   - 请根据文章实际内容自主判断"""
+    elif article_type_result['type'] == 'review':
+        type_specific_guidance = """
+💡 【仅供参考】规则检测提示本文可能是"综述/指南"类型，但请以实际内容为准：
+   - 综述中如果仅泛泛讨论可能的副作用，一般不算具体AE
+   - 但如果综述中引用了具体病例或AE数据统计，可按实际情况判断
+   - 请根据文章实际内容自主判断"""
+    elif article_type_result['type'] == 'case_report':
+        type_specific_guidance = """
+💡 【仅供参考】规则检测提示本文可能是"病例报告/案例分享"类型，但请以实际内容为准：
+   - 病例报告中"用药后出现XX"一般可视为存在因果关系
+   - patient_mode: 案例分享类文章可考虑判定为 single
+   - 请根据文章实际内容自主判断"""
+    elif article_type_result['type'] == 'clinical_study':
+        type_specific_guidance = """
+💡 【仅供参考】规则检测提示本文可能是"临床研究"类型，但请以实际内容为准：
+   - 临床研究中记录的不良反应一般可视为存在因果关系
+   - 请根据文章实际内容自主判断"""
+    else:
+        type_specific_guidance = ""
+
+    user_prompt = f"""⚠️ 本文献的目标监测药物（从文件名前缀提取）: {target_drug_hint}
+文件名: {filename}
+{article_type_info}{type_specific_guidance}
+{drug_search_info}
+其他药物关键词参考: {drug_hint}
 
 提取步骤:
-1. 仔细阅读文章全文
-2. 识别是否提到目标诺华药物（注意：PDF前缀通常包含对应产品名）
-3. 查找是否描述了不良事件(AE)
-4. 查找是否有明确的因果关系表述（"与药物相关"、"药物引起"等）
-5. 检查是否存在特殊情况（儿童用药、药物无效、怀孕暴露等）
-6. 判断患者数量:
-   - single: 单个患者（年龄性别可判断单一患者存在，或文章提到"1例"）
-   - multiple: 多个患者（>1例）
-   - mixed: 同时有单患者和多患者描述
+1. 阅读文章，理解实际内容（文章类型检测仅供参考，以实际内容为准）
+2. 根据【全文检索结果】和文章内容，判断是否提到目标药物
+   - 如果检索找到且有明确上下文，通常 has_drug=True
+   - 如果药物仅作为工具/背景提及，无安全监测价值，可考虑 has_drug=False
+3. 判断 has_ae：
+   - 关键问题：文章中是否描述了与药物相关的具体不良事件？
+   - 具体的患者AE描述、AE发生率统计 → has_ae=True
+   - 仅讨论疾病本身症状、理论风险 → has_ae=False
+4. 判断 has_causality：
+   - 明确因果表述（"导致"、"引起"、"相关"）→ has_causality=True
+   - 临床研究/病例报告中的AE一般可视为存在隐含因果关系
+5. 检查特殊情况（儿童用药、药物无效/疗效不佳、怀孕暴露等）
+6. 判断患者数量（根据文章实际内容）:
+   - single: 单个可识别患者的病例报告
+   - multiple: 多患者研究、队列研究
+   - mixed: 同时有单患者病例和多患者数据
    - unknown: 无明确患者信息
 
 分类逻辑说明:
