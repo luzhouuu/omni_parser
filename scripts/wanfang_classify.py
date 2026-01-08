@@ -108,6 +108,1398 @@ class ClassificationResult:
     error: str = ""
 
 
+# ============================================================
+# V2 结构化抽取架构 (v15) - 数据结构定义
+# ============================================================
+
+@dataclass
+class DocStruct:
+    """文档结构化解析结果"""
+    body_text: str           # 正文部分
+    ref_text: str            # 参考文献部分
+    author_text: str         # 作者信息部分
+    abbrev_map: dict         # 缩写映射 {"CSA": "环孢素", ...}
+    article_type: str        # 综述/动物/病例/临床
+    target_drug: str         # 目标药物(从文件名提取)
+    raw_text: str            # 原始全文
+
+
+@dataclass
+class DrugMention:
+    """药物提及结构"""
+    where: str              # body / ref / author
+    context_type: str       # study / intro / discussion / citation
+    mention_polarity: str   # used / not_used / history / background / unknown
+    surface_name: str       # 原文表述
+    normalized: str         # 标准化名称
+    novartis_judgement: str # yes / no / unknown
+    novartis_rule_hit: str  # step1~step5 命中的规则（空串表示未命中）
+    non_novartis_reason: str  # 如判断非诺华药，说明原因
+    evidence_span: str      # 原文片段
+
+
+@dataclass
+class AEEvent:
+    """不良事件结构"""
+    event_type: str         # normal_ae / special_situation / other_ae
+    special_subtype: str    # 特殊情况子类型: 孕期暴露/LOE/overdose/medication_error/off_label/儿童用药/药物相互作用/疾病进展/其他
+    description: str        # 事件描述
+    related_drug: str       # 关联的药物名称(必须填写)
+    related_drug_evidence: str  # 关联药物的原文证据
+    is_target_drug_related: bool  # 是否与目标药相关（LLM初判，规则层复核）
+    context_type: str       # study / case / citation / background / unknown
+    context_evidence: str   # 上下文判断证据
+    source: str             # table / text / unknown
+    raw_count_in_table: int | None  # 表格中事件计数（如1）
+    human_flag: str         # human / nonhuman / unclear
+    timing_relation: str    # after_drug / unclear / none
+    causality: str          # explicit / implicit / none / not_attributable_combo
+    causality_evidence: str # 因果关系的原文证据
+    patient_count: str      # single / multiple / unknown
+    patient_evidence: str   # 患者数证据
+    off_label: bool         # 是否超说明书
+    off_label_product: str  # 如off_label为true，填写产品名
+    whitelist_ok: bool      # off-label时是否在白名单
+    evidence_span: str      # 原文片段
+
+
+@dataclass
+class ExtractionResult:
+    """LLM结构化抽取结果"""
+    drug_mentions: list[DrugMention]
+    ae_events: list[AEEvent]
+    raw_response: dict = field(default_factory=dict)
+
+
+@dataclass
+class AuditResult:
+    """审计层结果"""
+    triggered_rules: list[str]   # 触发的规则ID列表
+    corrections: dict            # 修正内容 {field: (old, new, reason)}
+    retry_needed: bool           # 是否需要补问
+    retry_questions: list[str]   # 补问问题列表
+
+
+@dataclass
+class ClassificationResultV2:
+    """V2版本分类结果（结构化抽取）"""
+    filename: str
+    label: str
+    label_cn: str
+
+    # 核心判断
+    novartis_exposure: bool      # 是否有诺华药暴露
+    has_qualifying_event: bool   # 是否有合格事件
+
+    # 结构化抽取结果
+    extraction: ExtractionResult
+    audit: AuditResult
+
+    # 决策依据
+    confidence: float
+    reasoning: str
+    decision_path: str           # 决策路径描述
+
+    # 元信息
+    needs_review: bool
+    extract_method: str
+    text_length: int
+    classify_time: str = field(default_factory=lambda: datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    error: str = ""
+
+
+# ============================================================
+# V2 结构化抽取架构 - Phase 2: 输入处理模块
+# ============================================================
+
+def clean_text_v2(text: str) -> str:
+    """清洗PDF提取的文本，修复常见问题。
+
+    处理:
+    1. 断行修复：中文字符间的换行符
+    2. 断词修复：英文单词中间的换行符
+    3. 多余空白符清理
+    """
+    if not text:
+        return ""
+
+    # 1. 移除PDF提取中的页眉页脚噪音（常见模式）
+    lines = text.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        stripped = line.strip()
+        # 跳过纯页码行
+        if re.match(r'^[\d\s·\-—]+$', stripped):
+            continue
+        # 跳过常见页眉模式
+        if re.match(r'^(第\s*\d+\s*页|Page\s*\d+|Vol\.\s*\d+)', stripped, re.IGNORECASE):
+            continue
+        cleaned_lines.append(line)
+    text = '\n'.join(cleaned_lines)
+
+    # 2. 修复中文字符间的断行（保留段落间的换行）
+    # 如果前一个字符和后一个字符都是中文，移除中间的换行
+    text = re.sub(r'([\u4e00-\u9fff])\n([\u4e00-\u9fff])', r'\1\2', text)
+
+    # 3. 修复英文单词内的断行（连字符断词）
+    text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
+
+    # 4. 清理多余空白
+    text = re.sub(r'[ \t]+', ' ', text)  # 多个空格/制表符 → 单空格
+    text = re.sub(r'\n{3,}', '\n\n', text)  # 多余空行 → 双换行
+
+    return text.strip()
+
+
+def extract_abbreviations(text: str) -> dict[str, str]:
+    """从文本中提取缩写映射。
+
+    匹配模式:
+    - "环孢素(CSA)" → {"CSA": "环孢素"}
+    - "cyclosporin A (CSA)" → {"CSA": "cyclosporin A"}
+    - "CSA（环孢素）" → {"CSA": "环孢素"}
+
+    Returns:
+        dict: 缩写 → 全称的映射
+    """
+    abbrev_map = {}
+
+    # 模式1: 中文名(英文缩写) 或 英文名(缩写)
+    # 例如: 环孢素(CSA), cyclosporin A (CSA)
+    pattern1 = r'([\u4e00-\u9fff\w\s\-]+?)\s*[（\(]([A-Z][A-Z0-9\-]{1,10})[）\)]'
+    for match in re.finditer(pattern1, text):
+        full_name = match.group(1).strip()
+        abbrev = match.group(2).strip()
+        if len(full_name) >= 2 and abbrev not in abbrev_map:
+            abbrev_map[abbrev] = full_name
+
+    # 模式2: 缩写（中文全称）
+    # 例如: CSA（环孢素）
+    pattern2 = r'([A-Z][A-Z0-9\-]{1,10})\s*[（\(]([\u4e00-\u9fff]+)[）\)]'
+    for match in re.finditer(pattern2, text):
+        abbrev = match.group(1).strip()
+        full_name = match.group(2).strip()
+        if len(full_name) >= 2 and abbrev not in abbrev_map:
+            abbrev_map[abbrev] = full_name
+
+    return abbrev_map
+
+
+def segment_document(text: str) -> tuple[str, str, str]:
+    """将文档分割为正文、参考文献和作者信息部分。
+
+    Args:
+        text: 完整文档文本
+
+    Returns:
+        tuple: (body_text, ref_text, author_text)
+    """
+    # 默认值
+    body_text = text
+    ref_text = ""
+    author_text = ""
+
+    # 参考文献标记
+    ref_patterns = [
+        r'\n\s*参\s*考\s*文\s*献\s*\n',
+        r'\n\s*References?\s*\n',
+        r'\n\s*REFERENCES?\s*\n',
+        r'\n\s*参考文献[:：]\s*\n',
+        r'\n\s*\[参考文献\]\s*\n',
+    ]
+
+    ref_start = -1
+    for pattern in ref_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            ref_start = match.start()
+            break
+
+    if ref_start > 0:
+        body_text = text[:ref_start]
+        ref_text = text[ref_start:]
+
+    # 作者信息标记（通常在文章开头）
+    # 寻找作者单位、通讯作者等信息
+    author_patterns = [
+        r'(作者单位[:：].+?)(?=\n\s*\n)',
+        r'(通讯作者[:：].+?)(?=\n\s*\n)',
+        r'(Author.+?affiliation.+?)(?=\n\s*\n)',
+        r'(\d{6}\s+[\u4e00-\u9fff]+[省市].+?(?:医院|大学|研究院|中心).+?)(?=\n\s*\n)',
+    ]
+
+    for pattern in author_patterns:
+        match = re.search(pattern, body_text[:3000], re.IGNORECASE | re.DOTALL)
+        if match:
+            author_text = match.group(1).strip()
+            break
+
+    return body_text.strip(), ref_text.strip(), author_text.strip()
+
+
+def parse_document_v2(pdf_path: Path, target_drug: str | None = None) -> DocStruct:
+    """解析PDF文档，返回结构化的文档信息。
+
+    Args:
+        pdf_path: PDF文件路径
+        target_drug: 目标药物名称（可选，如不提供则从文件名提取）
+
+    Returns:
+        DocStruct: 结构化文档信息
+    """
+    filename = pdf_path.name
+
+    # 提取目标药物
+    if target_drug is None:
+        target_drug = extract_target_drug_from_filename(filename) or ""
+
+    # 提取文本
+    raw_text, method = extract_pdf_text(pdf_path)
+
+    if not raw_text.strip():
+        return DocStruct(
+            body_text="",
+            ref_text="",
+            author_text="",
+            abbrev_map={},
+            article_type="unknown",
+            target_drug=target_drug,
+            raw_text=""
+        )
+
+    # 清洗文本
+    cleaned_text = clean_text_v2(raw_text)
+
+    # 分割文档
+    body_text, ref_text, author_text = segment_document(cleaned_text)
+
+    # 提取缩写映射
+    abbrev_map = extract_abbreviations(cleaned_text)
+
+    # 检测文章类型
+    article_type_result = detect_article_type(cleaned_text, filename)
+    article_type = article_type_result.get('type', 'unknown')
+
+    return DocStruct(
+        body_text=body_text,
+        ref_text=ref_text,
+        author_text=author_text,
+        abbrev_map=abbrev_map,
+        article_type=article_type,
+        target_drug=target_drug,
+        raw_text=cleaned_text
+    )
+
+
+# ============================================================
+# V2 结构化抽取架构 - Phase 3: LLM结构化抽取模块
+# ============================================================
+
+def build_extraction_prompt_v2(doc: DocStruct, drug_keywords: list[str]) -> tuple[str, str]:
+    """构建V2版本的结构化抽取prompt。
+
+    Args:
+        doc: 结构化文档信息
+        drug_keywords: 药物关键词列表
+
+    Returns:
+        tuple: (system_prompt, user_prompt)
+    """
+    drug_hint = ", ".join(drug_keywords[:50]) if drug_keywords else "(未提供)"
+    abbrev_hint = ", ".join(f"{k}={v}" for k, v in list(doc.abbrev_map.items())[:10]) if doc.abbrev_map else "(无)"
+
+    system_prompt = """你是一位资深的药物警戒文献信息抽取专家。
+
+你的任务是从医学文献中**结构化抽取**两类关键信息（drug_mentions 与 ae_events），覆盖文中所有药物与AE。最终分类由规则层完成，你不需要输出分类标签。
+
+================================================================================
+## 抽取关键原则
+================================================================================
+1. 先抽“药物-AE配对”，再由规则层判断是否涉及目标药。
+2. 目标药只是检索关键词，不等于AE致因药，禁止默认归因到目标药。
+3. 每个AE事件必须给出related_drug（允许为unknown或X+Y）。
+4. 文章最终标签仅由“可绑定到目标药”的合格事件贡献：请在每个AEEvent中填 is_target_drug_related 与 related_drug_evidence，方便规则层二次判断。
+
+================================================================================
+## 第一步：药物提及与诺华判断（仅用于drug_mentions）
+================================================================================
+
+### 位置判断（最优先）
+- 产品**只出现在参考文献/作者信息**中，正文无提及 → 非诺华药暴露
+- 产品在**正文任意位置**出现 → 继续判断是否为诺华产品
+
+### 诺华产品判断规则（按顺序1→5，符合即停止）
+
+**step1_商品名判断**（最优先）
+- 提到诺华商品名 → 诺华药
+- 诺华商品名包括：山地明、新山地明、善宁、善龙、格列卫、维全特、诺欣妥、可善挺、恩瑞格、派立噻等
+- 提到非诺华商品名（如其他厂家品牌） → 非诺华药
+
+**step2_厂家/批文判断**
+- 文章注明厂家是诺华/北京诺华/Novartis → 诺华药
+- 批准文号对应诺华产品 → 诺华药
+- 明确注明其他厂家 → 非诺华药
+
+**step3_国产进口状态判断**
+- 文章提到"国产XX"，但诺华该产品只有进口 → 非诺华药
+- 文章提到"进口XX"，诺华有进口产品 → 可能诺华药
+
+**step4_剂型判断**
+- 注意包含关系：文章"片剂"+诺华"缓释片" → 算诺华药
+- 文章"缓释片"+诺华"片剂" → 不算诺华药
+- 剂型与诺华产品完全不符 → 非诺华药
+
+**step5_规格判断**
+- 文章明确给出规格，且诺华不生产该规格 → 非诺华药
+- 注意区分"剂量"和"规格"
+
+**无辅助信息时**
+- 仅使用通用名(如"环孢素")且无上述任何辅助判断信息 →
+  - 若该名称出现在“药物关键词参考”中，可判定为诺华药(novartis_judgement=yes)
+  - 否则标为unknown（不默认yes）
+
+### 特殊注意事项
+1. **缩写识别**：文章定义的缩写(如"环孢素(CsA)")，后文所有CsA都指环孢素
+2. **换行连接**：PDF提取可能有断行，需自动连接（如"环孢\n素"→"环孢素"）
+3. **多处提及分别判断**：作者试验用非诺华药，但引言/讨论引用他人数据用同成分药，需分别判断
+4. **盐酸莫西沙星特殊规则**：如治疗非眼部感染 → 非诺华药；眼部感染或不确定 → 诺华药
+
+================================================================================
+## 第二步：不良事件(AE)判断
+================================================================================
+
+### 基本定义
+任何用药后发生的所有异常，只需看**时间关系**（先用药后发生，看不出时间可保守判断为有）
+
+### 非AE排除（非常重要）
+以下内容**不属于AEEvent**，禁止抽成AE事件：
+- 诊断检查/影像学/显像/扫描本身的“分辨率低、图像质量差、结果混淆、假阳性/假阴性、难以操作/难以解读、检查敏感性/特异性”等（属于检测性能或操作问题，不是患者不良事件）
+- 仅讨论“检测结果是否准确/是否可重复/是否受干预影响”，但未描述患者出现症状/体征/实验室异常/疾病进展
+
+### AE分类
+
+**Normal AE（人体用药后异常）**
+- 体征/症状/疾病：用药后高热/头晕/低血糖/皮疹等
+- 检查值异常：文中注明异常，或超出正常范围
+- 疾病复发、停药后疾病加重/进展
+- **ADR统计/回顾性分析特例（非常重要）**：如果文章是“药品不良反应(ADR)回顾/统计”，且正文或表格/列表出现“药品名称 + ADR例数/占比(%)/排序”，则这属于药物相关AE信息：
+  - 必须抽取为 `AEEvent`（`event_type="normal_ae"`，`causality="implicit"`）
+  - `related_drug` 必须填写该行/该条对应的药品名称（不要写unknown）
+  - `patient_count` 按例数：例数>=2 → multiple；例数==1 → single；未给例数 → unknown
+  - `source` 填 `table`（若来自表格），并在 `raw_count_in_table` 填例数（如 5）
+  - 例子（这些都属于“药品名称 + 例数/占比”）：`环孢素软胶囊 5 1.63`、`环孢素软胶囊 5（1.63%）`、`环孢素软胶囊 5(1.63)`
+  - **当表格/列表包含目标药时，必须优先抽取目标药对应的那一条**
+
+**特殊情况(Special Situation)**
+1. **孕期/哺乳期暴露**：用药后妊娠/孕检阳性/生产/流产/早产/死胎等
+2. **感染传播**：通过药物传播的感染病
+3. **撤药/回弹反应**：停药后原始症状更严重
+4. **LOE(疗效缺失)**：
+	   - 用药后target适应症未改善/无效/效果不佳/患者耐药
+	   - 适应症相关症状持续出现（如用诺欣妥治心衰，用药后仍胸闷）
+	   - 免疫抑制剂(米芙/环孢素/巴利昔单抗)使用后出现排斥或GVHD
+	   - 实验室检查值用药前后无变化
+	   - **临床研究“疗效/总有效率”表格特例（非常重要）**：如果结果部分出现“显效/有效/无效/总有效率/总有效率=显效率+有效率”等，并且给出了**组别+例数/占比(%)**（例如：`表1 两组患者临床疗效比较[例(%)] ... 无效 4(8.00)`），则必须抽取 `LOE` 事件：
+	     - `event_type="special_situation"`, `special_subtype="LOE"`，`description` 表达“部分患者治疗无效/疗效不佳/未改善”
+	     - `patient_count` 按无效例数判断（>=2 multiple；==1 single），`raw_count_in_table` 填无效例数，`source="table"`, `context_type="study"`
+	     - 如果治疗方案中明确包含目标药（尤其对照组/基础治疗方案里列出了目标药），则该 LOE 的 `related_drug` 填目标药名，并 `is_target_drug_related=true`（不要写unknown）
+	   - 常见写法提示：疗效不佳/欠佳/未达标/控制不佳/未缓解/失败/总有效率/显效率/无效率/无效例数/有效例数
+5. **Overdose**：超过说明书最大剂量
+6. **有意错误用药/药物滥用/依赖/成瘾**
+7. **Medication errors**：
+   - 偶然暴露（误服）
+   - 职业暴露（药液接触医护）
+   - 处方/分发错误
+   - 药物管理不善（漏服/给药途径错误/自行掰片等）
+   - 注意：患者病好自行停药不算
+8. **药物相互作用/药食相互作用**
+9. **疾病进展/加重**：适应症进一步加重、肿瘤转移
+10. **意外获益**：治疗A病时B病好转
+11. **儿童用药**：患者年龄超出说明书允许范围（无儿童用药章节则<18岁）
+12. **Off-label use**：未按说明书适应症/剂量用药
+
+**其他AE(Other AE)**
+- 手术成功率≠100%、不良反应发生率≠0等
+- 体外实验/动物实验/菌种耐药测试中的安全问题
+- 有潜在风险但证据不充分
+- 诊断检查/影像学/显像/扫描的准确性问题（如假阳性/假阴性、分辨率、操作或解读困难）不算AE
+
+================================================================================
+## 事件级药物归因规则（必须遵守）
+================================================================================
+1. 每个AEEvent必须填写related_drug：
+   - 文中明确写“X药导致/诱发/相关” → related_drug=X
+   - 联合用药且无法明确归因 → causality="not_attributable_combo" 且 related_drug="X+Y"
+   - 仅知道“用药后出现”但无法判断是哪一个药 → related_drug="unknown"
+2. 禁止默认归因：目标药只是文献检索关键词，不等于AE的致因药。
+3. 但在临床研究/队列中，如果“不良反应/AE表格或结果”明确是在目标药治疗期间统计，且没有其他可疑药物，则 related_drug 应填目标药名，并 is_target_drug_related=true（source=table 时尤其如此）。
+
+================================================================================
+## 第三步：因果关系判断
+================================================================================
+
+**有因果关系(explicit)**
+- 文章明确提到：药物X"导致/引起/致使/诱发"AE
+- 药物中毒/药敏/药疹/过敏反应
+- "因XXX(不良事件)停用药物X"
+- 明确的副作用side effect/不良反应ADR
+
+**联合用药因果判断**
+- 药物A + 药物B联用，发生AE → 若不能明确归因到单一药物，设 causality="not_attributable_combo" 且 related_drug="A+B"
+- 研究药物为A+B，a组单用A，b组用A+B：
+  - a组AE → 有因果关系（related_drug=A）
+  - b组AE → 无法归因（not_attributable_combo，related_drug=A+B）
+
+**隐含因果(implicit)**
+- 临床研究中记录的治疗相关AE
+- 病例报告中"用药后出现XX"（若未指明具体药物，related_drug=unknown）
+
+================================================================================
+## 第四步：患者数量判断
+================================================================================
+
+**单患者(single)**
+- 通过性别/年龄可区分个例患者
+- 群组试验表格/描述中出现"1例"
+
+**多患者(multiple)**
+- 正文/图表提到：3例、10%、多例等
+
+================================================================================
+## Off-label特殊产品规则
+================================================================================
+
+Off-label use需根据产品判断分类：
+- **善宁、善龙、米芙、派立噻、恩瑞格、维莫思、泰立沙、派威妥** → 判ICSR/Multiple_Patients
+- **其他产品** → 判Other_Safety_Signal
+
+================================================================================
+## 输出格式
+================================================================================
+返回JSON:
+{
+  "drug_mentions": [
+    {
+      "where": "body|ref|author",
+      "context_type": "study|intro|discussion|citation",
+      "mention_polarity": "used|not_used|history|background|unknown",
+      "surface_name": "原文中的药物名称表述",
+      "normalized": "标准化药物名称",
+      "novartis_judgement": "yes|no|unknown",
+      "novartis_rule_hit": "step1_商品名|step2_厂家|step3_国产进口|step4_剂型|step5_规格|无辅助信息",
+      "non_novartis_reason": "如判断非诺华药，说明原因",
+      "evidence_span": "包含该药物提及的原文片段(20-50字)"
+    }
+  ],
+  "ae_events": [
+    {
+      "event_type": "normal_ae|special_situation|other_ae",
+      "special_subtype": "孕期暴露|LOE|overdose|medication_error|off_label|儿童用药|药物相互作用|疾病进展|其他",
+      "description": "事件简要描述",
+      "related_drug": "关联的药物名称(必须填；不明确填unknown，联用不可归因填X+Y)",
+      "related_drug_evidence": "原文中支撑related_drug的片段(10-40字)",
+      "is_target_drug_related": true,
+      "context_type": "study|case|citation|background|unknown",
+      "context_evidence": "用于判断context_type的原文片段(10-60字)",
+      "source": "table|text|unknown",
+      "raw_count_in_table": 1,
+      "human_flag": "human|nonhuman|unclear",
+      "timing_relation": "after_drug|unclear|none",
+      "causality": "explicit|implicit|none|not_attributable_combo",
+      "causality_evidence": "因果关系的原文证据",
+      "patient_count": "single|multiple|unknown",
+      "patient_evidence": "患者数量的证据(如'1例'/'纳入60例'/'3例头疼')",
+      "off_label": false,
+      "off_label_product": "如off_label为true，填写产品名",
+      "evidence_span": "包含该事件的原文片段(30-80字)"
+    }
+  ]
+}"""
+
+    user_prompt = f"""请从以下文献中进行结构化抽取。
+
+## 检索关键词（来自文件名，仅用于索引，不用于AE归因）
+{doc.target_drug or "(无法确定)"}
+
+## 药物关键词参考
+{drug_hint}
+
+## 文章缩写映射
+{abbrev_hint}
+
+## 文章类型（规则检测）
+{doc.article_type}
+
+## 正文内容(BODY)
+---
+{truncate_text(doc.body_text, 35000)}
+---
+
+## 参考文献部分(REF) [前2000字]
+---
+{doc.ref_text[:2000] if doc.ref_text else "(无)"}
+---
+
+## 作者信息部分(AUTHOR)
+---
+{doc.author_text or "(无)"}
+---
+
+请返回结构化JSON，包含 drug_mentions[] 和 ae_events[] 两个数组。
+每个药物提及和事件都必须带有 evidence_span（原文片段）。"""
+
+    return system_prompt, user_prompt
+
+
+def parse_extraction_response(response_json: dict) -> ExtractionResult:
+    """解析LLM返回的JSON，转换为ExtractionResult对象。
+
+    Args:
+        response_json: LLM返回的JSON字典
+
+    Returns:
+        ExtractionResult: 结构化抽取结果
+    """
+    drug_mentions = []
+    ae_events = []
+
+    # 解析 drug_mentions
+    raw_drugs = response_json.get("drug_mentions", []) or []
+    for dm in raw_drugs:
+        if not isinstance(dm, dict):
+            continue
+        drug_mentions.append(DrugMention(
+            where=str(dm.get("where", "body")),
+            context_type=str(dm.get("context_type", "study")),
+            mention_polarity=str(dm.get("mention_polarity", "unknown")),
+            surface_name=str(dm.get("surface_name", "")),
+            normalized=str(dm.get("normalized", "")),
+            novartis_judgement=str(dm.get("novartis_judgement", "unknown")),
+            novartis_rule_hit=str(dm.get("novartis_rule_hit", "")),
+            non_novartis_reason=str(dm.get("non_novartis_reason", "")),
+            evidence_span=str(dm.get("evidence_span", ""))
+        ))
+
+    # 解析 ae_events
+    raw_events = response_json.get("ae_events", []) or []
+    for ae in raw_events:
+        if not isinstance(ae, dict):
+            continue
+        related_drug = str(ae.get("related_drug", "")).strip()
+        if not related_drug:
+            related_drug = "unknown"
+        raw_count = ae.get("raw_count_in_table", None)
+        try:
+            raw_count_in_table = int(raw_count) if raw_count is not None else None
+        except Exception:
+            raw_count_in_table = None
+        ae_events.append(AEEvent(
+            event_type=str(ae.get("event_type", "other_ae")),
+            special_subtype=str(ae.get("special_subtype", "")),
+            description=str(ae.get("description", "")),
+            related_drug=related_drug,
+            related_drug_evidence=str(ae.get("related_drug_evidence", "")),
+            is_target_drug_related=bool(ae.get("is_target_drug_related", False)),
+            context_type=str(ae.get("context_type", "unknown")),
+            context_evidence=str(ae.get("context_evidence", "")),
+            source=str(ae.get("source", "unknown")),
+            raw_count_in_table=raw_count_in_table,
+            human_flag=str(ae.get("human_flag", "unclear")),
+            timing_relation=str(ae.get("timing_relation", "unclear")),
+            causality=str(ae.get("causality", "none")),
+            causality_evidence=str(ae.get("causality_evidence", "")),
+            patient_count=str(ae.get("patient_count", "unknown")),
+            patient_evidence=str(ae.get("patient_evidence", "")),
+            off_label=bool(ae.get("off_label", False)),
+            off_label_product=str(ae.get("off_label_product", "")),
+            whitelist_ok=bool(ae.get("whitelist_ok", False)),
+            evidence_span=str(ae.get("evidence_span", ""))
+        ))
+
+    return ExtractionResult(
+        drug_mentions=drug_mentions,
+        ae_events=ae_events,
+        raw_response=response_json
+    )
+
+
+def extract_with_openai_v2(doc: DocStruct, drug_keywords: list[str]) -> ExtractionResult:
+    """使用OpenAI进行V2版本结构化抽取。
+
+    Args:
+        doc: 结构化文档信息
+        drug_keywords: 药物关键词列表
+
+    Returns:
+        ExtractionResult: 结构化抽取结果
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return ExtractionResult(
+            drug_mentions=[],
+            ae_events=[],
+            raw_response={"error": "OPENAI_API_KEY not set"}
+        )
+
+    # Guard against hanging network calls.
+    client = OpenAI(api_key=api_key, timeout=120.0, max_retries=2)
+    system_prompt, user_prompt = build_extraction_prompt_v2(doc, drug_keywords)
+
+    try:
+        model = os.getenv("CLASSIFY_MODEL_NAME", "gpt-4o")
+        is_reasoning_model = model.startswith("o1") or model.startswith("o3")
+
+        create_kwargs = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+        }
+
+        if not is_reasoning_model:
+            create_kwargs["temperature"] = 0
+            create_kwargs["response_format"] = {"type": "json_object"}
+
+        response = client.chat.completions.create(**create_kwargs)
+        content = response.choices[0].message.content or "{}"
+
+        # 解析JSON
+        response_json = json.loads(content)
+        return parse_extraction_response(response_json)
+
+    except json.JSONDecodeError as e:
+        return ExtractionResult(
+            drug_mentions=[],
+            ae_events=[],
+            raw_response={"error": f"JSON parse error: {e}"}
+        )
+    except Exception as e:
+        return ExtractionResult(
+            drug_mentions=[],
+            ae_events=[],
+            raw_response={"error": str(e)}
+        )
+
+
+# ============================================================
+# V2 结构化抽取架构 - Phase 4: 审计层
+# ============================================================
+
+def normalize_drug_text(text: str) -> str:
+    """Normalize drug names for keyword matching."""
+    if not text:
+        return ""
+    return re.sub(r"[\s\-_\/()（）,，。·]+", "", text).lower()
+
+
+def build_drug_keyword_set(drug_keywords: list[str]) -> set[str]:
+    """Build a normalized keyword set for Novartis drug matching."""
+    return {normalize_drug_text(k) for k in drug_keywords if k.strip()}
+
+
+def is_novartis_keyword_match(name: str, keyword_set: set[str]) -> bool:
+    """Check if a name matches any Novartis keyword."""
+    name_norm = normalize_drug_text(name)
+    if not name_norm:
+        return False
+    return any(kw and kw in name_norm for kw in keyword_set)
+
+
+def is_novartis_mention(dm: DrugMention, keyword_set: set[str]) -> bool:
+    """Determine if a drug mention indicates Novartis exposure."""
+    if dm.novartis_judgement == "yes":
+        return True
+    if dm.novartis_judgement != "unknown":
+        return False
+    return (
+        is_novartis_keyword_match(dm.surface_name, keyword_set) or
+        is_novartis_keyword_match(dm.normalized, keyword_set)
+    )
+
+
+def build_target_alias_set(target_drug: str, drug_keywords: list[str]) -> set[str]:
+    """Build a normalized alias set for matching target drug mentions."""
+    aliases: set[str] = set()
+    if target_drug:
+        aliases.add(normalize_drug_text(target_drug))
+
+    # Reuse the alias map used in V1 search for common drugs.
+    drug_aliases = {
+        "卡马西平": ["carbamazepine", "tegretol", "得理多"],
+        "奥卡西平": ["oxcarbazepine", "trileptal", "曲莱"],
+        "缬沙坦": ["valsartan", "代文"],
+        "来曲唑": ["letrozole", "芙瑞"],
+        "环孢素": ["cyclosporine", "ciclosporin", "新山地明", "sandimmun", "sandimmune"],
+        "布林佐胺": ["brinzolamide", "派立明"],
+        "司库奇尤单抗": ["secukinumab", "可善挺", "cosentyx"],
+        "妥布霉素": ["tobramycin", "托百士"],
+        "雷珠单抗": ["ranibizumab", "诺适得", "lucentis"],
+        "沙库巴曲缬沙坦": ["sacubitril/valsartan", "诺欣妥", "entresto"],
+        "甲磺酸伊马替尼": ["imatinib", "格列卫", "gleevec", "glivec"],
+        "伊马替尼": ["imatinib", "格列卫", "gleevec", "glivec"],
+        "奥曲肽": ["octreotide", "善宁", "善龙", "sandostatin"],
+        "帕唑帕尼": ["pazopanib", "维全特", "votrient"],
+    }
+
+    target_norm = normalize_drug_text(target_drug)
+    for main_name, alias_list in drug_aliases.items():
+        main_norm = normalize_drug_text(main_name)
+        alias_norms = {normalize_drug_text(a) for a in alias_list}
+        if target_norm and (target_norm == main_norm or target_norm in alias_norms):
+            aliases.add(main_norm)
+            aliases.update(alias_norms)
+
+    # Include keywords that match/contain the target (handles product/generic variants).
+    if target_norm:
+        for kw in drug_keywords:
+            kw_norm = normalize_drug_text(kw)
+            if not kw_norm:
+                continue
+            if target_norm in kw_norm or kw_norm in target_norm:
+                aliases.add(kw_norm)
+
+    aliases.discard("")
+    return aliases
+
+
+def is_target_match(name: str, target_alias_set: set[str]) -> bool:
+    """Check if a name matches the target drug (aliases)."""
+    if not name:
+        return False
+    name_norm = normalize_drug_text(name)
+    if not name_norm:
+        return False
+    # Handle combo strings like "A+B"
+    parts = re.split(r"[+＋/、,，;；]", name_norm)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if any(alias and (alias in part or part in alias) for alias in target_alias_set):
+            return True
+    return any(alias and (alias in name_norm or name_norm in alias) for alias in target_alias_set)
+
+
+def is_negative_use_span(text: str) -> bool:
+    """Heuristic for 'not used' medication mentions."""
+    if not text:
+        return False
+    t = text.lower()
+    cues = ["未服用", "未使用", "未应用", "未给予", "未用药", "未曾使用", "停用", "未接受", "排除", "无近期用药"]
+    return any(cue.lower() in t for cue in cues)
+
+
+def audit_extraction(
+    extraction: ExtractionResult,
+    doc: DocStruct,
+    drug_keyword_set: set[str]
+) -> AuditResult:
+    """审计LLM抽取结果，检测常见错误并标记需要修正的内容。
+
+    审计规则:
+    1. reference_only_novartis: 诺华药只在 ref/author 出现 → 强制无暴露
+    2. missing_novartis_path: body有药但无step1-5命中 → 标记需审核
+    3. patient_count_no_evidence: patient_count无证据 → 标记需审核
+    4. combo_attribution: 明确多药联用 → 可能需标记无法归因
+    5. nonhuman_ae: AE的human_flag不是human → 可能不合格
+
+    Args:
+        extraction: LLM结构化抽取结果
+        doc: 文档结构信息
+        drug_keyword_set: 诺华药关键词集合
+
+    Returns:
+        AuditResult: 审计结果
+    """
+    triggered_rules = []
+    corrections = {}
+    retry_questions = []
+
+    # 规则1: reference_only_novartis
+    # 诺华药物仅出现在参考文献/作者信息中
+    # Audit uses broad Novartis keyword matching (not target-scoped).
+    body_novartis_mentions = [
+        dm for dm in extraction.drug_mentions
+        if dm.where == "body" and is_novartis_mention(dm, drug_keyword_set)
+    ]
+    ref_author_novartis_mentions = [
+        dm for dm in extraction.drug_mentions
+        if dm.where in ("ref", "author") and is_novartis_mention(dm, drug_keyword_set)
+    ]
+
+    if not body_novartis_mentions and ref_author_novartis_mentions:
+        triggered_rules.append("reference_only_novartis")
+        corrections["novartis_exposure"] = (
+            True, False,
+            "诺华药仅在参考文献/作者信息中出现，不在正文中"
+        )
+
+    # 规则2: missing_novartis_path
+    # 正文中有药物提及，但没有step1-5命中
+    body_mentions = [dm for dm in extraction.drug_mentions if dm.where == "body"]
+    for dm in body_mentions:
+        if dm.novartis_judgement == "unknown" and not dm.novartis_rule_hit:
+            if (
+                is_novartis_keyword_match(dm.surface_name, drug_keyword_set) or
+                is_novartis_keyword_match(dm.normalized, drug_keyword_set)
+            ):
+                continue
+            triggered_rules.append("missing_novartis_path")
+            retry_questions.append(
+                f"药物'{dm.surface_name}'在正文中出现，但未命中诺华药判断规则(step1-5)，请确认是否为诺华产品"
+            )
+            break  # 只记录一次
+
+    # 规则3: patient_count_no_evidence
+    # AE事件有patient_count但无evidence
+    for ae in extraction.ae_events:
+        if ae.patient_count in ("single", "multiple") and not ae.patient_evidence:
+            triggered_rules.append("patient_count_no_evidence")
+            retry_questions.append(
+                f"事件'{ae.description[:30]}'的患者数({ae.patient_count})缺少证据"
+            )
+            break
+
+    # 规则4: nonhuman_ae
+    # 检查是否有非人体AE被标记为安全事件
+    human_ae_count = sum(1 for ae in extraction.ae_events if ae.human_flag == "human")
+    nonhuman_ae_count = sum(1 for ae in extraction.ae_events if ae.human_flag == "nonhuman")
+    if nonhuman_ae_count > 0 and human_ae_count == 0:
+        triggered_rules.append("nonhuman_only")
+        # 这不是错误，但需要在分类时考虑
+
+    # 规则5: combo_attribution
+    # 检查是否存在明确的联合用药且标记了因果关系
+    combo_keywords = ["联合", "合用", "联用", "合并用药", "combination"]
+    for ae in extraction.ae_events:
+        if ae.causality in ("explicit", "implicit"):
+            evidence_lower = ae.evidence_span.lower()
+            if any(kw in evidence_lower for kw in combo_keywords):
+                # 检查是否有多个药物
+                drug_count = sum(
+                    1 for dm in extraction.drug_mentions
+                    if dm.where == "body" and dm.surface_name.lower() in evidence_lower
+                )
+                if drug_count > 1:
+                    triggered_rules.append("combo_attribution")
+                    # 不修正causality，只标记
+                    break
+
+    return AuditResult(
+        triggered_rules=triggered_rules,
+        corrections=corrections,
+        retry_needed=len(retry_questions) > 0,
+        retry_questions=retry_questions
+    )
+
+
+def apply_audit_corrections(
+    extraction: ExtractionResult,
+    audit: AuditResult
+) -> ExtractionResult:
+    """应用审计层的修正到抽取结果。
+
+    注意：当前版本的审计修正主要影响后续的分类决策，
+    而不是直接修改ExtractionResult。
+
+    Args:
+        extraction: 原始抽取结果
+        audit: 审计结果
+
+    Returns:
+        ExtractionResult: 可能修正后的抽取结果
+    """
+    # 当前版本不直接修改extraction，而是让classify_by_rules_v2根据audit结果做决策
+    return extraction
+
+
+# ============================================================
+# V2 结构化抽取架构 - Phase 5: 规则分类升级
+# ============================================================
+
+# Off-label特殊产品白名单：这些产品的off-label use可以判ICSR/Multiple_Patients
+OFF_LABEL_WHITELIST_PRODUCTS = {
+    "善宁", "善龙", "米芙", "派立噻", "恩瑞格", "维莫思", "泰立沙", "派威妥",
+    # 英文名/通用名
+    "sandostatin", "somatuline", "myfortic", "exjade", "votrient", "tasigna", "promacta",
+}
+
+
+def is_off_label_whitelist_product(product_name: str) -> bool:
+    """判断产品是否在off-label白名单中。
+
+    白名单产品的off-label use可以进入ICSR/Multiple_Patients分类。
+    非白名单产品的off-label use只能进入Other_Safety_Signal。
+
+    Args:
+        product_name: 产品名称
+
+    Returns:
+        bool: 是否在白名单中
+    """
+    if not product_name:
+        return False
+    product_lower = product_name.lower()
+    for whitelist_name in OFF_LABEL_WHITELIST_PRODUCTS:
+        if whitelist_name.lower() in product_lower or product_lower in whitelist_name.lower():
+            return True
+    return False
+
+
+def _infer_context_type_fallback(ae: AEEvent) -> str:
+    """Infer context type if LLM didn't provide it reliably."""
+    ctx = (ae.context_type or "").strip().lower()
+    text = f"{ae.context_evidence}\n{ae.evidence_span}\n{ae.causality_evidence}".lower()
+    citation_cues = [
+        "参考文献", "文献报道", "据报道", "既往研究", "研究表明", "已有报道", "见文献", "报道如下", "meta",
+    ]
+    if any(cue in text for cue in citation_cues) or re.search(r"\[\s*\d+\s*\]", text):
+        return "citation"
+    background_cues = ["可能", "常见", "风险", "提示", "应注意", "发生率", "%", "约为", "potential", "may"]
+    # Treat generic risk statements as background unless there's explicit temporal/case framing.
+    strong_time_cues = ["用药后", "治疗期间", "服用后", "停药", "再激发", "challenge", "dechallenge", "rechallenge"]
+    case_cues = ["病例", "例", "患者，", "患者,", "n=", "入组", "纳入"]
+    if any(cue in text for cue in background_cues) and not any(cue in text for cue in strong_time_cues) and not any(cue in text for cue in case_cues):
+        return "background"
+    # Override: statistics-style sentences are usually background/citation even if they mention '患者'
+    if ("发生率" in text or "%" in text or "约为" in text) and not any(cue in text for cue in ["本研究", "试验组", "对照组", "纳入"]):
+        return "background"
+    if ctx in ("study", "case", "citation", "background"):
+        return ctx
+    return "unknown"
+
+
+def _is_countable_context(ae: AEEvent) -> bool:
+    ctx = _infer_context_type_fallback(ae)
+    return ctx not in ("citation", "background")
+
+
+def _extract_table_counts(text: str) -> set[int]:
+    """Extract counts from table-like snippets such as '1（2.86）'."""
+    if not text:
+        return set()
+    counts = set()
+    for m in re.finditer(r"(\d{1,3})\s*[（(]\s*\d+(?:\.\d+)?\s*[)）]", text):
+        try:
+            counts.add(int(m.group(1)))
+        except Exception:
+            continue
+    return counts
+
+
+def is_target_related_event(ae: AEEvent, target_alias_set: set[str]) -> bool:
+    """Determine whether an event can be bound to the target drug."""
+    if not target_alias_set:
+        return False
+    if ae.related_drug and ae.related_drug != "unknown" and is_target_match(ae.related_drug, target_alias_set):
+        return True
+
+    # Evidence-based fallback (no free default):
+    # - If the event explicitly cites the target drug in any evidence, accept.
+    combined = f"{ae.related_drug_evidence}\n{ae.context_evidence}\n{ae.evidence_span}".strip()
+    combined_norm = normalize_drug_text(combined)
+    if any(alias and alias in combined_norm for alias in target_alias_set):
+        return True
+
+    # Trial AE tables often omit drug name in the AE row; rely on LLM + table source.
+    if ae.is_target_drug_related and (ae.source or "").lower() == "table":
+        if "不良反应" in (ae.evidence_span or "") or "adverse" in (ae.evidence_span or "").lower():
+            return True
+
+    # If LLM explicitly marked target-related and context is countable, accept as bound.
+    if ae.is_target_drug_related and _is_countable_context(ae):
+        return True
+
+    return False
+
+
+def is_qualifying_event(
+    ae: AEEvent,
+    audit: AuditResult,
+    *,
+    target_alias_set: set[str],
+    require_target: bool = True,
+) -> bool:
+    """判断AE事件是否为"合格事件"（可纳入安全报告的事件）。
+
+    合格事件定义:
+    1. normal_ae: 必须是human + (explicit或implicit因果) + 非not_attributable_combo
+    2. special_situation:
+       - 如果是off_label，需要产品在白名单(善宁/善龙/米芙/派立噻/恩瑞格/维莫思/泰立沙/派威妥)
+       - 否则直接合格（但审计层可能降级）
+
+    Args:
+        ae: AE事件
+        audit: 审计结果（用于检查是否被降级）
+
+    Returns:
+        bool: 是否为合格事件
+    """
+    # 检查审计层是否对此事件有降级修正
+    ae_key = f"ae_{ae.description[:20]}_qualification"
+    if ae_key in audit.corrections:
+        old_val, new_val, reason = audit.corrections[ae_key]
+        if new_val is False:
+            return False
+
+    if not _is_countable_context(ae):
+        return False
+
+    if ae.causality == "not_attributable_combo":
+        return False
+
+    # Hard gate: only target-related events can contribute to ICSR/Multiple.
+    # We verify using alias matching; LLM flag is advisory.
+    if require_target:
+        if not is_target_related_event(ae, target_alias_set):
+            return False
+
+    if ae.event_type == "normal_ae":
+        # 常规AE：必须是人体+有因果+非联用不可归因
+        if ae.human_flag != "human":
+            return False
+        if ae.causality not in ("explicit", "implicit"):
+            return False
+        return True
+
+    elif ae.event_type == "special_situation":
+        # 特殊情况
+        if ae.special_subtype == "LOE":
+            # LOE/无效必须明确绑定目标药
+            if not is_target_related_event(ae, target_alias_set):
+                return False
+            # If evidence doesn't explicitly mention the drug, allow study/table LOE where target is the regimen.
+            span_norm = normalize_drug_text(ae.evidence_span)
+            if target_alias_set and not any(alias and alias in span_norm for alias in target_alias_set):
+                ctx = _infer_context_type_fallback(ae)
+                if not (ctx == "study" or (ae.source or "").lower() == "table"):
+                    return False
+        if ae.off_label:
+            # 超说明书用药需要在白名单
+            # 动态判断：如果LLM返回了off_label_product，用它判断
+            # 否则使用LLM返回的whitelist_ok
+            if ae.off_label_product:
+                return is_off_label_whitelist_product(ae.off_label_product)
+            return ae.whitelist_ok
+        # 其他特殊情况（儿童用药、药物无效等）直接合格
+        # 但需要是人体相关
+        if ae.human_flag == "nonhuman":
+            return False
+        return True
+
+    # other_ae 类型不计入合格事件，但可能作为 Other_Safety_Signal
+    return False
+
+
+def determine_patient_mode_v2(ae_events: list[AEEvent]) -> str:
+    """根据AE事件列表确定患者模式。
+
+    Args:
+        ae_events: 合格的AE事件列表
+
+    Returns:
+        str: 患者模式 (single/multiple/mixed/unknown)
+    """
+    has_single = False
+    has_multiple = False
+
+    for ae in ae_events:
+        counts = _extract_table_counts(ae.patient_evidence or "") | _extract_table_counts(ae.evidence_span or "")
+        has_table_single = (ae.raw_count_in_table == 1) or (1 in counts)
+        if ae.patient_count == "single" or has_table_single:
+            has_single = True
+        elif ae.patient_count == "multiple":
+            has_multiple = True
+
+    if has_single and has_multiple:
+        return "mixed"
+    elif has_single:
+        return "single"
+    elif has_multiple:
+        return "multiple"
+    else:
+        return "unknown"
+
+
+def classify_by_rules_v2(
+    extraction: ExtractionResult,
+    audit: AuditResult,
+    *,
+    drug_keyword_set: set[str],
+    target_drug: str,
+    target_alias_set: set[str],
+) -> tuple[str, str, bool, bool]:
+    """V2版本的规则分类决策树。
+
+    决策树:
+    1. novartis_exposure = False → Rejection
+    2. novartis_exposure + 无ae_events → Rejection
+    3. 有qualifying_event(single) + qualifying_event(multiple) → ICSR+Multiple_Patients
+    4. 仅有qualifying_event(single) → ICSR
+    5. 仅有qualifying_event(multiple) → Multiple_Patients
+    6. 有诺华暴露+有事件但不合格 → Other_Safety_Signal
+
+    Args:
+        extraction: 结构化抽取结果
+        audit: 审计结果
+        drug_keyword_set: 诺华药关键词集合
+        target_drug: 目标药物名称（文件名前缀）
+        target_alias_set: 目标药别名集合（归一化）
+
+    Returns:
+        tuple: (label, decision_path, novartis_exposure, has_qualifying_event)
+    """
+    # Step 1: 判断诺华暴露
+    # 检查审计层是否强制修正了暴露状态
+    if "novartis_exposure" in audit.corrections:
+        _, novartis_exposure, _ = audit.corrections["novartis_exposure"]
+    else:
+        # 暴露：正文中出现目标药物（used/history），并满足诺华药关键词或LLM判断
+        def is_positive_polarity(dm: DrugMention) -> bool:
+            pol = (dm.mention_polarity or "unknown").lower()
+            if pol in ("used", "history"):
+                return True
+            if pol == "not_used":
+                return False
+            # Fallback: detect negation in evidence span
+            return not is_negative_use_span(dm.evidence_span)
+
+        novartis_exposure = any(
+            dm.where == "body"
+            and is_target_match(dm.surface_name or dm.normalized, target_alias_set)
+            and is_positive_polarity(dm)
+            and is_novartis_mention(dm, drug_keyword_set)
+            for dm in extraction.drug_mentions
+        )
+
+    # 如果无暴露 → Rejection
+    if not novartis_exposure:
+        return "Rejection", "无诺华药暴露", False, False
+
+    # Step 2: 检查是否有可计入的AE事件（排除citation/background）
+    countable_events = [
+        ae for ae in extraction.ae_events
+        if _is_countable_context(ae) and ae.human_flag != "nonhuman"
+    ]
+    if not countable_events:
+        return "Rejection", "有暴露但无AE事件", True, False
+
+    # Step 3: 筛选合格事件
+    qualifying_events = [
+        ae for ae in countable_events
+        if is_qualifying_event(ae, audit, target_alias_set=target_alias_set, require_target=True)
+    ]
+
+    if not qualifying_events:
+        # 有暴露、有事件但无合格事件 → Other_Safety_Signal
+        return "Other_Safety_Signal", "有暴露+有事件但无合格事件", True, False
+
+    # Step 4: 确定患者模式
+    patient_mode = determine_patient_mode_v2(qualifying_events)
+
+    # Step 5: 根据患者模式决定标签
+    if patient_mode == "mixed":
+        return "ICSR+Multiple_Patients", "有暴露+合格事件(单+多)", True, True
+    elif patient_mode == "single":
+        return "ICSR", "有暴露+合格事件(单患者)", True, True
+    elif patient_mode == "multiple":
+        return "Multiple_Patients", "有暴露+合格事件(多患者)", True, True
+    else:
+        # unknown patient_mode → Other_Safety_Signal
+        return "Other_Safety_Signal", "有暴露+合格事件但患者数未知", True, True
+
+
+def classify_paper_v2(
+    pdf_path: Path,
+    drug_keywords: list[str],
+) -> ClassificationResultV2:
+    """V2版本的完整分类流程。
+
+    流程:
+    1. 解析文档 (parse_document_v2)
+    2. 结构化抽取 (extract_with_openai_v2)
+    3. 审计层 (audit_extraction)
+    4. 规则分类 (classify_by_rules_v2)
+
+    Args:
+        pdf_path: PDF文件路径
+        drug_keywords: 药物关键词列表
+
+    Returns:
+        ClassificationResultV2: V2版本分类结果
+    """
+    filename = pdf_path.name
+
+    # Step 1: 解析文档
+    doc = parse_document_v2(pdf_path)
+
+    if not doc.raw_text.strip():
+        # 文本提取失败
+        return ClassificationResultV2(
+            filename=filename,
+            label="Error",
+            label_cn="错误",
+            novartis_exposure=False,
+            has_qualifying_event=False,
+            extraction=ExtractionResult([], [], {}),
+            audit=AuditResult([], {}, False, []),
+            confidence=0.0,
+            reasoning="文本提取失败",
+            decision_path="",
+            needs_review=True,
+            extract_method="none",
+            text_length=0,
+            error="Text extraction failed"
+        )
+
+    # Step 2: 结构化抽取
+    extraction = extract_with_openai_v2(doc, drug_keywords)
+    drug_keyword_set = build_drug_keyword_set(drug_keywords)
+    target_alias_set = build_target_alias_set(doc.target_drug, drug_keywords)
+
+    # 检查抽取是否有错误
+    if "error" in extraction.raw_response:
+        return ClassificationResultV2(
+            filename=filename,
+            label="Error",
+            label_cn="错误",
+            novartis_exposure=False,
+            has_qualifying_event=False,
+            extraction=extraction,
+            audit=AuditResult([], {}, False, []),
+            confidence=0.0,
+            reasoning=f"抽取错误: {extraction.raw_response.get('error')}",
+            decision_path="",
+            needs_review=True,
+            extract_method="pdftotext",
+            text_length=len(doc.raw_text),
+            error=str(extraction.raw_response.get("error", ""))
+        )
+
+    # Step 3: 审计层
+    audit = audit_extraction(extraction, doc, drug_keyword_set)
+
+    # Step 4: 规则分类
+    label, decision_path, novartis_exposure, has_qualifying = classify_by_rules_v2(
+        extraction,
+        audit,
+        drug_keyword_set=drug_keyword_set,
+        target_drug=doc.target_drug,
+        target_alias_set=target_alias_set,
+    )
+
+    # 计算置信度
+    confidence = calculate_confidence_v2(extraction, audit)
+
+    # 生成reasoning
+    reasoning = generate_reasoning_v2(extraction, audit, label, decision_path)
+
+    return ClassificationResultV2(
+        filename=filename,
+        label=label,
+        label_cn=SAFETY_LABELS.get(label, "未知"),
+        novartis_exposure=novartis_exposure,
+        has_qualifying_event=has_qualifying,
+        extraction=extraction,
+        audit=audit,
+        confidence=confidence,
+        reasoning=reasoning,
+        decision_path=decision_path,
+        needs_review=confidence < 0.7 or audit.retry_needed,
+        extract_method="pdftotext",
+        text_length=len(doc.raw_text),
+    )
+
+
+def calculate_confidence_v2(extraction: ExtractionResult, audit: AuditResult) -> float:
+    """计算V2版本分类结果的置信度。
+
+    Args:
+        extraction: 结构化抽取结果
+        audit: 审计结果
+
+    Returns:
+        float: 置信度 (0.0-1.0)
+    """
+    confidence = 0.85  # 基础置信度
+
+    # 审计层触发规则会降低置信度
+    if audit.triggered_rules:
+        confidence -= 0.05 * len(audit.triggered_rules)
+
+    # 需要补问会大幅降低置信度
+    if audit.retry_needed:
+        confidence -= 0.15
+
+    # 药物提及有诺华规则命中会提高置信度
+    has_rule_hit = any(
+        dm.novartis_rule_hit
+        for dm in extraction.drug_mentions
+        if dm.where == "body"
+    )
+    if has_rule_hit:
+        confidence += 0.05
+
+    # AE事件有明确因果会提高置信度
+    has_explicit_causality = any(
+        ae.causality == "explicit"
+        for ae in extraction.ae_events
+    )
+    if has_explicit_causality:
+        confidence += 0.05
+
+    return max(0.3, min(0.95, confidence))
+
+
+def generate_reasoning_v2(
+    extraction: ExtractionResult,
+    audit: AuditResult,
+    label: str,
+    decision_path: str
+) -> str:
+    """生成V2版本分类结果的推理说明。
+
+    Args:
+        extraction: 结构化抽取结果
+        audit: 审计结果
+        label: 分类标签
+        decision_path: 决策路径
+
+    Returns:
+        str: 推理说明
+    """
+    parts = []
+
+    # 决策路径
+    parts.append(f"决策: {label} ({decision_path})")
+
+    # 药物提及统计
+    body_drugs = [dm for dm in extraction.drug_mentions if dm.where == "body"]
+    ref_drugs = [dm for dm in extraction.drug_mentions if dm.where in ("ref", "author")]
+    parts.append(f"药物提及: 正文{len(body_drugs)}个, 参考文献{len(ref_drugs)}个")
+
+    # AE事件统计
+    if extraction.ae_events:
+        human_ae = [ae for ae in extraction.ae_events if ae.human_flag == "human"]
+        nonhuman_ae = [ae for ae in extraction.ae_events if ae.human_flag == "nonhuman"]
+        parts.append(f"AE事件: 人体{len(human_ae)}个, 非人体{len(nonhuman_ae)}个")
+
+    # 审计层触发
+    if audit.triggered_rules:
+        parts.append(f"审计规则触发: {', '.join(audit.triggered_rules)}")
+
+    # 审计修正
+    if audit.corrections:
+        corrections_str = "; ".join(
+            f"{k}: {reason}"
+            for k, (old, new, reason) in audit.corrections.items()
+        )
+        parts.append(f"修正: {corrections_str}")
+
+    return " | ".join(parts)
+
+
 def which(cmd: str) -> str | None:
     """Find executable in PATH."""
     import shutil
@@ -597,7 +1989,7 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
    - ✅ YES的情况：
      - 明确归因："与...相关"、"由...引起"、"归因于"、"药物诱发"、"导致"
      - 时间关联+明确因果："用药后出现XX症状"、"治疗期间发生"、"停药后缓解"
-     - 去激发/再激发阳性
+         - 去激发/再激发阳性
      - 病例报告中明确描述药物引起的症状
      - ⚠️ 临床研究隐含因果（新增）：
        * "治疗期间记录不良反应"、"观察指标包括不良反应"
@@ -1625,6 +3017,135 @@ def classify_papers(
     return results
 
 
+# ============================================================
+# V2 结构化抽取架构 - Phase 6: 集成入口
+# ============================================================
+
+def classify_papers_v2(
+    input_dir: Path,
+    output_path: Path,
+    drug_keywords: list[str],
+    max_papers: int = 0,
+) -> list[ClassificationResultV2]:
+    """V2版本的批量分类入口。
+
+    Args:
+        input_dir: 输入目录（包含PDF文件）
+        output_path: 输出CSV文件路径
+        drug_keywords: 药物关键词列表
+        max_papers: 最大分类数量（0表示无限制）
+
+    Returns:
+        list[ClassificationResultV2]: 分类结果列表
+    """
+    pdf_files = sorted(input_dir.glob("*.pdf"))
+    total = len(pdf_files)
+
+    if max_papers > 0:
+        pdf_files = pdf_files[:max_papers]
+
+    print(f"\n📚 [V2] Classifying {len(pdf_files)} papers (from {total} total)")
+    print(f"   Drug keywords: {len(drug_keywords)}")
+    print(f"   Mode: Structured Extraction (v15)")
+    print("=" * 60)
+
+    results: list[ClassificationResultV2] = []
+
+    for idx, pdf_path in enumerate(pdf_files, 1):
+        filename = pdf_path.name
+        print(f"\n[{idx}/{len(pdf_files)}] 📄 {filename[:50]}...")
+
+        # V2分类流程
+        print("      🔄 Parsing document...")
+        result = classify_paper_v2(pdf_path, drug_keywords)
+        results.append(result)
+
+        if result.error:
+            print(f"      ❌ Error: {result.error}")
+        else:
+            print(f"      ✅ {result.label} ({result.label_cn})")
+            print(f"         Confidence: {result.confidence:.2f}")
+            print(f"         Decision: {result.decision_path}")
+            # 显示抽取统计
+            body_drugs = len([dm for dm in result.extraction.drug_mentions if dm.where == "body"])
+            ae_count = len(result.extraction.ae_events)
+            print(f"         Extracted: {body_drugs} body drugs, {ae_count} AE events")
+            # 显示审计信息
+            if result.audit.triggered_rules:
+                print(f"         Audit: {', '.join(result.audit.triggered_rules)}")
+            if result.needs_review:
+                print("         ⚠️ Needs human review")
+
+    # 写入CSV（V2格式）
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fieldnames_v2 = [
+        "filename", "label", "label_cn", "confidence", "needs_review",
+        "novartis_exposure", "has_qualifying_event", "decision_path",
+        "body_drug_count", "ae_event_count", "human_ae_count",
+        "audit_rules", "audit_corrections",
+        "reasoning", "extract_method", "text_length", "classify_time", "error"
+    ]
+
+    with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames_v2, quoting=csv.QUOTE_ALL)
+        writer.writeheader()
+        for result in results:
+            body_drugs = [dm for dm in result.extraction.drug_mentions if dm.where == "body"]
+            human_ae = [ae for ae in result.extraction.ae_events if ae.human_flag == "human"]
+            row = {
+                "filename": result.filename,
+                "label": result.label,
+                "label_cn": result.label_cn,
+                "confidence": result.confidence,
+                "needs_review": result.needs_review,
+                "novartis_exposure": result.novartis_exposure,
+                "has_qualifying_event": result.has_qualifying_event,
+                "decision_path": result.decision_path,
+                "body_drug_count": len(body_drugs),
+                "ae_event_count": len(result.extraction.ae_events),
+                "human_ae_count": len(human_ae),
+                "audit_rules": "; ".join(result.audit.triggered_rules),
+                "audit_corrections": "; ".join(
+                    f"{k}:{reason}" for k, (old, new, reason) in result.audit.corrections.items()
+                ),
+                "reasoning": result.reasoning,
+                "extract_method": result.extract_method,
+                "text_length": result.text_length,
+                "classify_time": result.classify_time,
+                "error": result.error,
+            }
+            writer.writerow(row)
+
+    # Summary
+    print("\n" + "=" * 60)
+    print("📊 [V2] Classification Summary:")
+
+    label_counts: dict[str, int] = {}
+    error_count = 0
+    review_count = 0
+    for r in results:
+        if r.error:
+            error_count += 1
+        else:
+            label_counts[r.label] = label_counts.get(r.label, 0) + 1
+            if r.needs_review:
+                review_count += 1
+
+    for label, count in sorted(label_counts.items(), key=lambda x: -x[1]):
+        print(f"   {label}: {count}")
+
+    if error_count:
+        print(f"   Errors: {error_count}")
+    if review_count:
+        print(f"   ⚠️ Needs review: {review_count}")
+
+    print(f"\n📁 Results saved to: {output_path}")
+    print("=" * 60)
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Wanfang Paper Safety Classification Script")
     parser.add_argument(
@@ -1656,6 +3177,11 @@ def main():
         type=int,
         default=0,
         help="Maximum papers to classify (0 = unlimited)",
+    )
+    parser.add_argument(
+        "--use-v2",
+        action="store_true",
+        help="Use V2 structured extraction architecture (v15)",
     )
 
     args = parser.parse_args()
@@ -1695,14 +3221,25 @@ def main():
         print(f"   Examples: {', '.join(drug_keywords[:5])}")
     print(f"Max papers: {args.max_papers if args.max_papers > 0 else 'unlimited'}")
     print(f"Found {pdf_count} PDF files")
+    print(f"Mode: {'V2 Structured Extraction' if args.use_v2 else 'V1 (5-Boolean)'}")
     print("=" * 60)
 
-    results = classify_papers(
-        input_dir=args.input_dir,
-        output_path=args.output,
-        drug_keywords=drug_keywords,
-        max_papers=args.max_papers,
-    )
+    if args.use_v2:
+        # 使用 V2 结构化抽取架构
+        results = classify_papers_v2(
+            input_dir=args.input_dir,
+            output_path=args.output,
+            drug_keywords=drug_keywords,
+            max_papers=args.max_papers,
+        )
+    else:
+        # 使用原有 V1 架构
+        results = classify_papers(
+            input_dir=args.input_dir,
+            output_path=args.output,
+            drug_keywords=drug_keywords,
+            max_papers=args.max_papers,
+        )
 
     error_count = sum(1 for r in results if r.error)
     return 1 if error_count == len(results) else 0
