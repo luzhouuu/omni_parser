@@ -33,13 +33,20 @@ import json
 import os
 import subprocess
 import tempfile
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+# Multi-Agent Classification (optional)
+try:
+    from multi_agent_classify import classify_with_multi_agent, MultiAgentResult
+    MULTI_AGENT_AVAILABLE = True
+except ImportError:
+    MULTI_AGENT_AVAILABLE = False
 
 # Load environment variables
 load_dotenv()
@@ -574,15 +581,17 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
    - 即使只是简单提及或作为背景信息，也算has_drug=True
 
 2. **has_ae** (boolean): 是否描述了与药物使用相关的不良事件(AE)？
-   - ✅ YES的情况：
-     - 病例报告/临床研究中描述的副作用、毒性反应、不良反应
-     - 患者用药后出现的负面健康结果（如：皮疹、出血、感染、器官损伤等）
-     - 临床试验中记录的不良反应发生率（如"不良反应发生率15%"）
-   - ❌ NO的情况：
-     - 纯粹描述疾病本身症状，与药物无关（如"高血压可导致心脏病"）
-     - 综述/指南中仅讨论疾病机制，未涉及药物不良反应
-     - 文章仅讨论药物疗效/机制，未提及任何负面事件
-   - ⚠️ 关键判断：文章中是否有"用药后/治疗期间出现的负面事件"描述
+   - ✅ YES的情况（必须是人体临床中实际发生的）：
+     - 病例报告中具体患者用药后出现的不良反应
+     - 临床研究中明确记录的不良反应数据和发生率
+     - 有具体患者、具体症状、具体时间的AE描述
+   - ❌ NO的情况（必须严格排除）：
+     - 综述/指南中假设性讨论（如"该药可能导致XX"、"常见副作用包括"）
+     - 仅列举药物名称和疾病名称，但无具体病例证据
+     - 动物实验中的毒性反应（不算人体AE）
+     - 疾病本身症状（如肿瘤患者的腹泻是疾病症状，非药物AE）
+     - 文献背景介绍中提及的一般性风险讨论
+   - ⚠️ 关键判断：必须是"人体临床中实际发生的、有具体证据的药物相关AE"
 
 3. **has_causality** (boolean): 是否有因果关系表述将药物与不良事件联系起来？
    - ✅ YES的情况：
@@ -590,12 +599,15 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
      - 时间关联+明确因果："用药后出现XX症状"、"治疗期间发生"、"停药后缓解"
      - 去激发/再激发阳性
      - 病例报告中明确描述药物引起的症状
+     - ⚠️ 临床研究隐含因果（新增）：
+       * "治疗期间记录不良反应"、"观察指标包括不良反应"
+       * "两组不良反应比较"、"试验组vs对照组AE发生率"
+       * 对照研究设计本身隐含了对治疗相关AE的因果判断
    - ❌ NO的情况：
      - 综述/指南仅泛泛讨论药物可能的副作用（无具体病例）
-     - 仅是AE发生率统计，无具体因果描述
      - 明确否定因果关系
      - 仅描述疾病自然病程
-   - ⚠️ 需要有具体的因果描述，不是仅仅提及AE
+   - ⚠️ 临床研究中如果将"不良反应"作为观察指标，即视为存在隐含因果
 
 4. **has_special_situation** (boolean): 是否存在以下特殊情况？⚠️ 特殊情况可独立构成安全信号
    - 妊娠/哺乳期暴露 (Pregnancy/lactation exposure)
@@ -608,10 +620,15 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
    - ❌ 注意：常规临床研究中的"联合用药"、"加量"不算特殊情况
 
 5. **patient_mode** (string): 患者识别
-   - "single": 单个可识别患者（标题含"1例"、"个案"、"病例报告"，有明确的单一患者信息）
-   - "multiple": 多个患者（队列研究、临床试验、回顾性分析，有明确样本量）
+   - "single": 单个可识别患者
+     * 标题含"1例"、"个案"、"病例报告"
+     * ⚠️ "案例分享"/"病例分享"类文献：即使包含多个病例（病案1、病案2），每个病例仍是独立的单患者报告，应判为single
+   - "multiple": 多个患者（队列研究、临床试验、回顾性分析）
+     * 必须有明确样本量（如"纳入100例"、"n=50"）
+     * 必须是多例患者的合并研究/统计分析
    - "mixed": 文章中既有单患者病例，又有多患者统计数据
    - "unknown": 综述/指南，无明确患者信息
+   - ⚠️ 优先级规则：先识别文献类型，再判断患者模式。"案例分享"优先判为single
 
 仅返回包含这些字段和证据数组的JSON对象。"""
 
@@ -853,6 +870,569 @@ def classify_with_openai(text: str, filename: str, drug_keywords: list[str]) -> 
         )
 
 
+def critique_classification(
+    initial_result: ClassificationResult,
+    text: str,
+    article_type: str,
+    filename: str = ""
+) -> ClassificationResult:
+    """
+    Self-Critique 层：审视初步判断，发现并修正常见错误。
+
+    支持五种审核模式：
+    1. has_ae 过于宽松：综述/动物实验中的AE误判
+    2. has_ae 过于严格：病例/临床研究中遗漏隐含AE
+    3. has_causality 过于严格：病例报告/临床研究中的隐含因果被遗漏
+    4. has_special_situation 过于严格：遗漏药物无效、儿童用药、妊娠暴露等特殊情况
+    5. patient_mode 案例分享误判：将"案例分享"类文献误判为multiple
+    """
+    # 文章类型中文映射
+    type_cn_map = {
+        'review': '综述/指南',
+        'animal_study': '动物实验',
+        'case_report': '病例报告',
+        'clinical_study': '临床研究',
+        'unknown': '未知'
+    }
+    article_type_cn = type_cn_map.get(article_type, article_type)
+
+    # 确定审核模式
+    critique_modes = []
+
+    # 模式1: has_ae 可能过于宽松（综述/动物实验中误判AE）
+    if initial_result.has_ae and article_type in ['review', 'animal_study']:
+        critique_modes.append('ae_too_loose')
+
+    # 模式2: has_causality 可能过于严格（病例/临床研究中遗漏隐含因果）
+    # 修复：移除 has_ae 前置条件，因为 ae_too_strict 可能会修正 has_ae
+    # 让因果审核独立于 AE 判断
+    if (initial_result.has_drug and
+        not initial_result.has_causality and
+        article_type in ['case_report', 'clinical_study']):
+        critique_modes.append('causality_too_strict')
+
+    # 模式3: has_special_situation 可能过于严格（遗漏特殊情况）
+    # 触发条件：有药物但无特殊情况，且文本中可能包含特殊情况关键词
+    if (initial_result.has_drug and
+        not initial_result.has_special_situation and
+        article_type in ['case_report', 'clinical_study']):
+        # 检查是否可能存在特殊情况关键词
+        special_keywords = [
+            '无效', '疗效不佳', '治疗失败', '未能控制', '控制不佳', '病情未改善',
+            '换药', '停药', '更换', '调整方案',
+            '儿童', '小儿', '患儿', '婴儿', '幼儿', '新生儿', '青少年',
+            '妊娠', '孕妇', '怀孕', '哺乳', '母乳', '产妇',
+            '过量', '中毒', '超剂量',
+            '用药错误', '给药错误', '剂量错误',
+            '联合用药', '药物相互作用', '合用', '配伍',
+            '超说明书', '超适应症', 'off-label',
+        ]
+        text_lower = text.lower()
+        if any(kw in text_lower for kw in special_keywords):
+            critique_modes.append('special_too_strict')
+
+    # 模式4: has_ae 可能过于严格（遗漏临床研究中的隐含AE）
+    # 触发条件：has_ae=False + 病例/临床研究 + 有药物 + 文中含AE相关关键词
+    if (initial_result.has_drug and
+        not initial_result.has_ae and
+        article_type in ['case_report', 'clinical_study']):
+        ae_hint_keywords = [
+            '不良反应', '记录', '观察', '监测', '安全性',
+            '服用', '口服', '用药', '治疗期间'
+        ]
+        text_lower = text.lower()
+        if any(kw in text_lower for kw in ae_hint_keywords):
+            critique_modes.append('ae_too_strict')
+
+    # 模式5: patient_mode "案例分享"误判（将案例分享误判为multiple）
+    # 触发条件：patient_mode=multiple + 文件名或正文含"案例分享"
+    if initial_result.patient_mode == 'multiple':
+        case_sharing_keywords = ['案例分享', '病例分享', '病案分享', '案例举隅', '病案举隅']
+        text_lower = text.lower()
+        filename_lower = filename.lower()
+        if (any(kw in text_lower for kw in case_sharing_keywords) or
+            any(kw in filename_lower for kw in case_sharing_keywords)):
+            critique_modes.append('patient_mode_case_sharing')
+
+    if not critique_modes:
+        return initial_result
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return initial_result
+
+    client = OpenAI(api_key=api_key)
+    result = initial_result
+
+    # 依次执行每种审核模式
+    for mode in critique_modes:
+        if mode == 'ae_too_loose':
+            result = _critique_ae_too_loose(client, result, text, article_type_cn)
+        elif mode == 'causality_too_strict':
+            result = _critique_causality_too_strict(client, result, text, article_type_cn)
+        elif mode == 'special_too_strict':
+            result = _critique_special_too_strict(client, result, text, article_type_cn)
+        elif mode == 'ae_too_strict':
+            result = _critique_ae_too_strict(client, result, text, article_type_cn)
+        elif mode == 'patient_mode_case_sharing':
+            result = _critique_patient_mode_case_sharing(client, result, text, filename)
+
+    return result
+
+
+def _critique_ae_too_loose(
+    client,
+    initial_result: ClassificationResult,
+    text: str,
+    article_type_cn: str
+) -> ClassificationResult:
+    """审核 has_ae 是否过于宽松（综述/动物实验误判）"""
+
+    critique_prompt = f"""你是药物安全分类审核专家。请审视以下分类判断是否存在常见错误。
+
+## 初步判断
+- has_ae: {initial_result.has_ae}
+- has_ae_reasoning: {initial_result.has_ae_reasoning}
+- 文章类型: {article_type_cn}
+
+## 需检查的常见错误
+1. 【综述误判】综述/指南中仅泛泛讨论药物可能的副作用（如"该药物可能导致XX"），无具体病例报告，不应判定 has_ae=True
+2. 【动物实验】纯动物实验中的毒性反应（如大鼠肝损伤）不算人体AE，不应判定 has_ae=True
+3. 【疾病症状】疾病本身的症状（如神经内分泌肿瘤的腹泻、潮红）不是药物AE
+
+## 相关原文片段
+{text[:4000]}
+
+## 请判断
+1. 初步判断是否存在上述错误？
+2. 如存在错误，has_ae 应该修正为什么？
+3. 给出修正理由。
+
+返回JSON:
+{{
+    "has_error": boolean,
+    "corrected_has_ae": boolean,
+    "correction_reasoning": "修正理由"
+}}"""
+
+    try:
+        model = os.getenv("CLASSIFY_MODEL_NAME", "gpt-4o")
+        is_reasoning_model = model.startswith("o1") or model.startswith("o3")
+
+        create_kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": critique_prompt}],
+        }
+
+        if not is_reasoning_model:
+            create_kwargs["temperature"] = 0
+            create_kwargs["response_format"] = {"type": "json_object"}
+
+        response = client.chat.completions.create(**create_kwargs)
+        content = response.choices[0].message.content or "{}"
+        critique_result = json.loads(content)
+
+        if critique_result.get("has_error"):
+            corrected_has_ae = critique_result.get("corrected_has_ae", False)
+            correction_reasoning = critique_result.get("correction_reasoning", "")
+
+            # 重新应用规则判断
+            new_label = classify_by_rules(
+                initial_result.has_drug,
+                corrected_has_ae,
+                initial_result.has_causality,
+                initial_result.has_special_situation,
+                initial_result.patient_mode
+            )
+
+            return replace(
+                initial_result,
+                has_ae=corrected_has_ae,
+                has_ae_reasoning=f"{initial_result.has_ae_reasoning}\n[Self-Critique:AE修正]: {correction_reasoning}",
+                label=new_label,
+                label_cn=SAFETY_LABELS.get(new_label, "未知")
+            )
+
+    except Exception as e:
+        print(f"      ⚠️ Self-Critique (AE) error: {e}")
+
+    return initial_result
+
+
+def _critique_causality_too_strict(
+    client,
+    initial_result: ClassificationResult,
+    text: str,
+    article_type_cn: str
+) -> ClassificationResult:
+    """审核 has_causality 是否过于严格（病例/临床研究中遗漏隐含因果）"""
+
+    critique_prompt = f"""你是药物安全分类审核专家。请审视以下分类判断是否遗漏了文章中的因果关系证据。
+
+## 初步判断
+- has_ae: {initial_result.has_ae}
+- has_causality: {initial_result.has_causality}
+- has_causality_reasoning: {initial_result.has_causality_reasoning}
+- 文章类型: {article_type_cn}
+
+## 重要原则
+has_causality 的判断目的是确定文章是否包含药物-AE因果分析信息，用于药物警戒文献筛选：
+- ⚠️ 即使AE是由文中其他药物（非目标监测药物）引起的，只要文章包含明确的药物-AE因果关系表述，has_causality仍应为True
+- 这样做是为了确保包含安全性信息的文献能被正确标记，供人工审核
+
+## 需检查的遗漏情况
+在病例报告或临床研究中，以下情况应视为存在因果关系（has_causality=True）：
+
+1. 【明确归因】文章中任何药物被明确归因为AE的原因（如"X药导致Y症状"、"Y由X引起"）
+2. 【病例报告因果】病例报告中描述"用药后出现XX症状"，即使未明确说"导致"，也应视为存在因果
+3. 【临床研究AE】临床研究/试验中记录的不良反应发生率（如"治疗组不良反应发生率15%"），应视为存在隐含因果
+4. 【时间关联】明确的时间关联表述（如"服药3天后出现"、"治疗期间发生"）应视为因果证据
+5. 【去激发/再激发】停药后症状缓解、再用药后复发，是强因果证据
+
+## 相关原文片段
+{text[:4000]}
+
+## 请判断
+1. 文章中是否存在任何药物-AE因果关系的表述（不限于目标药物）？
+2. 如果初步判断遗漏了因果关系，has_causality 应该修正为True
+3. 给出修正理由和具体证据。
+
+返回JSON:
+{{
+    "has_error": boolean,
+    "corrected_has_causality": boolean,
+    "correction_reasoning": "修正理由"
+}}"""
+
+    try:
+        model = os.getenv("CLASSIFY_MODEL_NAME", "gpt-4o")
+        is_reasoning_model = model.startswith("o1") or model.startswith("o3")
+
+        create_kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": critique_prompt}],
+        }
+
+        if not is_reasoning_model:
+            create_kwargs["temperature"] = 0
+            create_kwargs["response_format"] = {"type": "json_object"}
+
+        response = client.chat.completions.create(**create_kwargs)
+        content = response.choices[0].message.content or "{}"
+        critique_result = json.loads(content)
+
+        if critique_result.get("has_error"):
+            corrected_has_causality = critique_result.get("corrected_has_causality", True)
+            correction_reasoning = critique_result.get("correction_reasoning", "")
+
+            # 重新应用规则判断
+            new_label = classify_by_rules(
+                initial_result.has_drug,
+                initial_result.has_ae,
+                corrected_has_causality,
+                initial_result.has_special_situation,
+                initial_result.patient_mode
+            )
+
+            return replace(
+                initial_result,
+                has_causality=corrected_has_causality,
+                has_causality_reasoning=f"{initial_result.has_causality_reasoning}\n[Self-Critique:因果修正]: {correction_reasoning}",
+                label=new_label,
+                label_cn=SAFETY_LABELS.get(new_label, "未知")
+            )
+
+    except Exception as e:
+        print(f"      ⚠️ Self-Critique (Causality) error: {e}")
+
+    return initial_result
+
+
+def _critique_special_too_strict(
+    client,
+    initial_result: ClassificationResult,
+    text: str,
+    article_type_cn: str
+) -> ClassificationResult:
+    """审核 has_special_situation 是否过于严格（遗漏特殊情况）"""
+
+    critique_prompt = f"""你是药物安全分类审核专家。请审视以下分类判断是否遗漏了特殊情况。
+
+## 初步判断
+- has_drug: {initial_result.has_drug}
+- has_special_situation: {initial_result.has_special_situation}
+- has_special_reasoning: {initial_result.has_special_reasoning}
+- 文章类型: {article_type_cn}
+
+## 需检查的特殊情况（任一存在即应判定 has_special_situation=True）
+
+1. 【药物无效/疗效不佳】⚠️ 这是最常遗漏的特殊情况
+   - 关键词："无效"、"疗效不佳"、"治疗失败"、"未能控制"、"控制不佳"、"病情未改善"
+   - 关键词："换药"、"更换治疗方案"、"调整用药"、"效果欠佳"
+   - 注意：即使文章主题不是讨论药物无效，只要提到目标药物"无效/失败"就算
+
+2. 【儿童用药】
+   - 患者为儿童、婴幼儿、青少年（<18岁）
+   - 关键词："患儿"、"小儿"、"儿童"、"婴儿"、"幼儿"、"新生儿"
+
+3. 【妊娠/哺乳期暴露】
+   - 患者为孕妇或哺乳期妇女
+   - 关键词："妊娠"、"孕妇"、"怀孕"、"哺乳"、"母乳"、"产妇"
+
+4. 【过量/中毒】
+   - 药物过量使用或中毒
+   - 关键词："过量"、"中毒"、"超剂量"
+
+5. 【用药错误】
+   - 给药错误、剂量错误、用法错误
+   - 关键词："用药错误"、"给药错误"、"剂量错误"
+
+6. 【药物相互作用】
+   - 与其他药物的相互作用导致问题
+   - 关键词："药物相互作用"、"联合用药不良反应"
+
+7. 【超说明书用药】
+   - 超适应症、超剂量、超人群使用
+   - 关键词："超说明书"、"超适应症"、"off-label"
+
+## 相关原文片段
+{text[:4000]}
+
+## 请判断
+1. 初步判断是否遗漏了上述任一特殊情况？
+2. 如有遗漏，has_special_situation 应该修正为什么？
+3. 给出修正理由和具体证据。
+
+返回JSON:
+{{
+    "has_error": boolean,
+    "corrected_has_special": boolean,
+    "correction_reasoning": "修正理由，包括具体是哪种特殊情况"
+}}"""
+
+    try:
+        model = os.getenv("CLASSIFY_MODEL_NAME", "gpt-4o")
+        is_reasoning_model = model.startswith("o1") or model.startswith("o3")
+
+        create_kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": critique_prompt}],
+        }
+
+        if not is_reasoning_model:
+            create_kwargs["temperature"] = 0
+            create_kwargs["response_format"] = {"type": "json_object"}
+
+        response = client.chat.completions.create(**create_kwargs)
+        content = response.choices[0].message.content or "{}"
+        critique_result = json.loads(content)
+
+        if critique_result.get("has_error"):
+            corrected_has_special = critique_result.get("corrected_has_special", True)
+            correction_reasoning = critique_result.get("correction_reasoning", "")
+
+            # 重新应用规则判断
+            new_label = classify_by_rules(
+                initial_result.has_drug,
+                initial_result.has_ae,
+                initial_result.has_causality,
+                corrected_has_special,
+                initial_result.patient_mode
+            )
+
+            return replace(
+                initial_result,
+                has_special_situation=corrected_has_special,
+                has_special_reasoning=f"{initial_result.has_special_reasoning}\n[Self-Critique:特殊情况修正]: {correction_reasoning}",
+                label=new_label,
+                label_cn=SAFETY_LABELS.get(new_label, "未知")
+            )
+
+    except Exception as e:
+        print(f"      ⚠️ Self-Critique (Special) error: {e}")
+
+    return initial_result
+
+
+def _critique_ae_too_strict(
+    client,
+    initial_result: ClassificationResult,
+    text: str,
+    article_type_cn: str
+) -> ClassificationResult:
+    """审核 has_ae 是否过于严格（遗漏了临床研究中的隐含AE）"""
+
+    critique_prompt = f"""你是药物安全分类审核专家。请审视以下分类判断是否遗漏了隐含的不良事件信息。
+
+## 初步判断
+- has_drug: {initial_result.has_drug}
+- has_ae: {initial_result.has_ae} (当前判断为False)
+- has_ae_reasoning: {initial_result.has_ae_reasoning}
+- 文章类型: {article_type_cn}
+
+## 需检查的遗漏情况
+
+1. 【临床研究隐含AE】
+   - 如果是临床研究/对照研究，且"不良反应"作为观察指标
+   - 关键词："记录不良反应"、"观察不良反应"、"不良反应发生率"
+   - 关键词："两组不良反应比较"、"治疗组vs对照组"
+   - 即使全文未详细列出AE，研究设计本身隐含了AE监测
+
+2. 【病例报告背景用药】
+   - 病例报告中患者有明确的目标药物用药记录
+   - 即使主要AE不是目标药物引起，背景用药构成安全监测场景
+   - 关键词："服用/口服[目标药物]"、"既往用药"
+
+3. 【治疗期间观察】
+   - 临床研究中"治疗期间密切观察/监测"
+   - 隐含了对潜在AE的关注
+
+## 相关原文片段
+{text[:4000]}
+
+## 请判断
+1. 初步判断是否遗漏了上述任一隐含AE情况？
+2. 如有遗漏，has_ae 应该修正为什么？
+3. 给出修正理由和具体证据。
+
+返回JSON:
+{{
+    "has_error": boolean,
+    "corrected_has_ae": boolean,
+    "correction_reasoning": "修正理由"
+}}"""
+
+    try:
+        model = os.getenv("CLASSIFY_MODEL_NAME", "gpt-4o")
+        is_reasoning_model = model.startswith("o1") or model.startswith("o3")
+
+        create_kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": critique_prompt}],
+        }
+
+        if not is_reasoning_model:
+            create_kwargs["temperature"] = 0
+            create_kwargs["response_format"] = {"type": "json_object"}
+
+        response = client.chat.completions.create(**create_kwargs)
+        content = response.choices[0].message.content or "{}"
+        critique_result = json.loads(content)
+
+        if critique_result.get("has_error"):
+            corrected_has_ae = critique_result.get("corrected_has_ae", True)
+            correction_reasoning = critique_result.get("correction_reasoning", "")
+
+            # 重新应用规则判断
+            new_label = classify_by_rules(
+                initial_result.has_drug,
+                corrected_has_ae,
+                initial_result.has_causality,
+                initial_result.has_special_situation,
+                initial_result.patient_mode
+            )
+
+            return replace(
+                initial_result,
+                has_ae=corrected_has_ae,
+                has_ae_reasoning=f"{initial_result.has_ae_reasoning}\n[Self-Critique:AE过严修正]: {correction_reasoning}",
+                label=new_label,
+                label_cn=SAFETY_LABELS.get(new_label, "未知")
+            )
+
+    except Exception as e:
+        print(f"      ⚠️ Self-Critique (AE过严) error: {e}")
+
+    return initial_result
+
+
+def _critique_patient_mode_case_sharing(
+    client,
+    initial_result: ClassificationResult,
+    text: str,
+    filename: str
+) -> ClassificationResult:
+    """审核 patient_mode 是否将"案例分享"误判为 multiple"""
+
+    critique_prompt = f"""你是药物安全分类审核专家。请审视患者模式判断是否正确。
+
+## 初步判断
+- patient_mode: {initial_result.patient_mode} (当前判断为multiple)
+- patient_reasoning: {initial_result.patient_reasoning}
+- 文件名: {filename}
+
+## 需检查的误判情况
+
+**"案例分享"类文献特殊规则**：
+- 如果文章类型是"案例分享"/"病例分享"/"病案分享"
+- 即使包含多个病例（如"病案1"、"病案2"、"案例一"、"案例二"）
+- 每个病例都是**独立的单患者报告(ICSR)**
+- 应该判断为 patient_mode="single"，而非 "multiple"
+
+## 判断依据
+- 标题或正文含"案例分享"/"病例分享"/"病案分享" → single
+- 正文结构为"病案1...病案2..." → 多个独立单例，算single
+- 明确样本量"纳入XX例"并做统计分析 → 才是真正的 multiple
+
+## 相关原文片段
+{text[:3000]}
+
+## 请判断
+1. 该文献是否为"案例分享"类型？
+2. 如果是，patient_mode 应该修正为 "single" 吗？
+3. 给出修正理由。
+
+返回JSON:
+{{
+    "has_error": boolean,
+    "corrected_patient_mode": "single" or "multiple",
+    "correction_reasoning": "修正理由"
+}}"""
+
+    try:
+        model = os.getenv("CLASSIFY_MODEL_NAME", "gpt-4o")
+        is_reasoning_model = model.startswith("o1") or model.startswith("o3")
+
+        create_kwargs = {
+            "model": model,
+            "messages": [{"role": "user", "content": critique_prompt}],
+        }
+
+        if not is_reasoning_model:
+            create_kwargs["temperature"] = 0
+            create_kwargs["response_format"] = {"type": "json_object"}
+
+        response = client.chat.completions.create(**create_kwargs)
+        content = response.choices[0].message.content or "{}"
+        critique_result = json.loads(content)
+
+        if critique_result.get("has_error"):
+            corrected_patient_mode = critique_result.get("corrected_patient_mode", "single")
+            correction_reasoning = critique_result.get("correction_reasoning", "")
+
+            # 重新应用规则判断
+            new_label = classify_by_rules(
+                initial_result.has_drug,
+                initial_result.has_ae,
+                initial_result.has_causality,
+                initial_result.has_special_situation,
+                corrected_patient_mode
+            )
+
+            return replace(
+                initial_result,
+                patient_mode=corrected_patient_mode,
+                patient_reasoning=f"{initial_result.patient_reasoning}\n[Self-Critique:案例分享修正]: {correction_reasoning}",
+                label=new_label,
+                label_cn=SAFETY_LABELS.get(new_label, "未知")
+            )
+
+    except Exception as e:
+        print(f"      ⚠️ Self-Critique (案例分享) error: {e}")
+
+    return initial_result
+
+
 def load_drug_keywords(path: Path) -> list[str]:
     """Load drug keywords from file."""
     if not path.exists():
@@ -909,10 +1489,70 @@ def classify_papers(
 
         print(f"      Extracted {len(text)} chars via {method}")
 
-        # Classify
-        print("      Classifying with LLM...")
-        result = classify_with_openai(text, filename, drug_keywords)
-        result.extract_method = method
+        # 选择分类模式
+        classify_mode = os.getenv("CLASSIFY_MODE", "default").lower()
+
+        if classify_mode == "multi_agent" and MULTI_AGENT_AVAILABLE:
+            # Multi-Agent 辩论模式
+            print("      🤖 Classifying with Multi-Agent debate...")
+            ma_result = classify_with_multi_agent(text, filename, drug_keywords)
+
+            # 转换为 ClassificationResult
+            result = ClassificationResult(
+                filename=filename,
+                label=ma_result.final_label,
+                label_cn=ma_result.final_label_cn,
+                has_drug=ma_result.has_drug,
+                has_ae=ma_result.has_ae,
+                has_causality=ma_result.has_causality,
+                has_special_situation=ma_result.has_special_situation,
+                patient_mode=ma_result.patient_mode,
+                patient_max_n=ma_result.patient_max_n,
+                confidence=ma_result.confidence,
+                drug_evidence=ma_result.pharmacologist.judgments.get("has_drug_evidence", []),
+                ae_evidence=ma_result.pharmacologist.judgments.get("has_ae_evidence", []),
+                causality_evidence=ma_result.clinician.judgments.get("causality_evidence", []),
+                special_evidence=ma_result.analyst.judgments.get("special_evidence", []),
+                patient_evidence=ma_result.clinician.judgments.get("patient_evidence", []),
+                has_drug_reasoning=f"[药物学专家] {ma_result.pharmacologist.reasoning}",
+                has_ae_reasoning=f"[药物学专家] {ma_result.pharmacologist.reasoning}",
+                has_causality_reasoning=f"[临床医生] {ma_result.clinician.reasoning}",
+                has_special_reasoning=f"[文献分析] {ma_result.analyst.reasoning}",
+                patient_reasoning=f"[临床医生] {ma_result.clinician.reasoning}",
+                reasoning=ma_result.reasoning,
+                needs_review=ma_result.needs_review,
+                extract_method=method,
+                text_length=len(text),
+            )
+        else:
+            # 原有分类模式
+            print("      Classifying with LLM...")
+            result = classify_with_openai(text, filename, drug_keywords)
+            result.extract_method = method
+
+            # Self-Critique 层（可选，通过环境变量控制）
+            if os.getenv("ENABLE_SELF_CRITIQUE", "false").lower() == "true":
+                article_type_result = detect_article_type(text, filename)
+                original_label = result.label
+                original_has_ae = result.has_ae
+                original_has_causality = result.has_causality
+                original_has_special = result.has_special_situation
+                original_patient_mode = result.patient_mode
+                result = critique_classification(result, text, article_type_result['type'], filename)
+
+                # 输出修正信息
+                corrections = []
+                if result.has_ae != original_has_ae:
+                    corrections.append(f"AE:{original_has_ae}→{result.has_ae}")
+                if result.has_causality != original_has_causality:
+                    corrections.append(f"因果:{original_has_causality}→{result.has_causality}")
+                if result.has_special_situation != original_has_special:
+                    corrections.append(f"特殊:{original_has_special}→{result.has_special_situation}")
+                if result.patient_mode != original_patient_mode:
+                    corrections.append(f"患者:{original_patient_mode}→{result.patient_mode}")
+                if corrections:
+                    print(f"      🔄 Self-Critique [{', '.join(corrections)}]: {original_label} → {result.label}")
+
         results.append(result)
 
         if result.error:
