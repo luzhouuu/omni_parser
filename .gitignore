@@ -72,5 +72,5 @@ downloads/
 # Data files (papers, CSV history)
 data/
 
-.pdf
+*.pdf
 .env
