@@ -742,7 +742,14 @@ def extract_with_openai_v2(doc: DocStruct, drug_keywords: list[str]) -> Extracti
         )
 
     # Guard against hanging network calls.
-    client = OpenAI(api_key=api_key, timeout=120.0, max_retries=2)
+    # NOTE: In some environments, the default socket read may hang indefinitely; enforce explicit request timeouts.
+    try:
+        import httpx  # type: ignore
+        timeout = httpx.Timeout(connect=15.0, read=90.0, write=30.0, pool=15.0)
+    except Exception:
+        timeout = 90.0
+
+    client = OpenAI(api_key=api_key, timeout=timeout, max_retries=2)
     system_prompt, user_prompt = build_extraction_prompt_v2(doc, drug_keywords)
 
     try:
@@ -761,6 +768,8 @@ def extract_with_openai_v2(doc: DocStruct, drug_keywords: list[str]) -> Extracti
             create_kwargs["temperature"] = 0
             create_kwargs["response_format"] = {"type": "json_object"}
 
+        # Per-request timeout (overrides client default if supported by the SDK).
+        create_kwargs.setdefault("timeout", timeout)
         response = client.chat.completions.create(**create_kwargs)
         content = response.choices[0].message.content or "{}"
 
@@ -3051,32 +3060,7 @@ def classify_papers_v2(
 
     results: list[ClassificationResultV2] = []
 
-    for idx, pdf_path in enumerate(pdf_files, 1):
-        filename = pdf_path.name
-        print(f"\n[{idx}/{len(pdf_files)}] 📄 {filename[:50]}...")
-
-        # V2分类流程
-        print("      🔄 Parsing document...")
-        result = classify_paper_v2(pdf_path, drug_keywords)
-        results.append(result)
-
-        if result.error:
-            print(f"      ❌ Error: {result.error}")
-        else:
-            print(f"      ✅ {result.label} ({result.label_cn})")
-            print(f"         Confidence: {result.confidence:.2f}")
-            print(f"         Decision: {result.decision_path}")
-            # 显示抽取统计
-            body_drugs = len([dm for dm in result.extraction.drug_mentions if dm.where == "body"])
-            ae_count = len(result.extraction.ae_events)
-            print(f"         Extracted: {body_drugs} body drugs, {ae_count} AE events")
-            # 显示审计信息
-            if result.audit.triggered_rules:
-                print(f"         Audit: {', '.join(result.audit.triggered_rules)}")
-            if result.needs_review:
-                print("         ⚠️ Needs human review")
-
-    # 写入CSV（V2格式）
+    # 写入CSV（V2格式）- 增量写入，避免中途中断丢失进度
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     fieldnames_v2 = [
@@ -3087,35 +3071,64 @@ def classify_papers_v2(
         "reasoning", "extract_method", "text_length", "classify_time", "error"
     ]
 
+    def to_csv_row(result: ClassificationResultV2) -> dict:
+        body_drugs = [dm for dm in result.extraction.drug_mentions if dm.where == "body"]
+        human_ae = [ae for ae in result.extraction.ae_events if ae.human_flag == "human"]
+        return {
+            "filename": result.filename,
+            "label": result.label,
+            "label_cn": result.label_cn,
+            "confidence": result.confidence,
+            "needs_review": result.needs_review,
+            "novartis_exposure": result.novartis_exposure,
+            "has_qualifying_event": result.has_qualifying_event,
+            "decision_path": result.decision_path,
+            "body_drug_count": len(body_drugs),
+            "ae_event_count": len(result.extraction.ae_events),
+            "human_ae_count": len(human_ae),
+            "audit_rules": "; ".join(result.audit.triggered_rules),
+            "audit_corrections": "; ".join(
+                f"{k}:{reason}" for k, (old, new, reason) in result.audit.corrections.items()
+            ),
+            "reasoning": result.reasoning,
+            "extract_method": result.extract_method,
+            "text_length": result.text_length,
+            "classify_time": result.classify_time,
+            "error": result.error,
+        }
+
     with open(output_path, 'w', encoding='utf-8-sig', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames_v2, quoting=csv.QUOTE_ALL)
         writer.writeheader()
-        for result in results:
-            body_drugs = [dm for dm in result.extraction.drug_mentions if dm.where == "body"]
-            human_ae = [ae for ae in result.extraction.ae_events if ae.human_flag == "human"]
-            row = {
-                "filename": result.filename,
-                "label": result.label,
-                "label_cn": result.label_cn,
-                "confidence": result.confidence,
-                "needs_review": result.needs_review,
-                "novartis_exposure": result.novartis_exposure,
-                "has_qualifying_event": result.has_qualifying_event,
-                "decision_path": result.decision_path,
-                "body_drug_count": len(body_drugs),
-                "ae_event_count": len(result.extraction.ae_events),
-                "human_ae_count": len(human_ae),
-                "audit_rules": "; ".join(result.audit.triggered_rules),
-                "audit_corrections": "; ".join(
-                    f"{k}:{reason}" for k, (old, new, reason) in result.audit.corrections.items()
-                ),
-                "reasoning": result.reasoning,
-                "extract_method": result.extract_method,
-                "text_length": result.text_length,
-                "classify_time": result.classify_time,
-                "error": result.error,
-            }
-            writer.writerow(row)
+
+        for idx, pdf_path in enumerate(pdf_files, 1):
+            filename = pdf_path.name
+            print(f"\n[{idx}/{len(pdf_files)}] 📄 {filename[:50]}...")
+
+            # V2分类流程
+            print("      🔄 Parsing document...")
+            result = classify_paper_v2(pdf_path, drug_keywords)
+            results.append(result)
+
+            # 增量写入并flush
+            writer.writerow(to_csv_row(result))
+            f.flush()
+
+            if result.error:
+                print(f"      ❌ Error: {result.error}")
+            else:
+                print(f"      ✅ {result.label} ({result.label_cn})")
+                print(f"         Confidence: {result.confidence:.2f}")
+                print(f"         Decision: {result.decision_path}")
+                # 显示抽取统计
+                body_drugs = len([dm for dm in result.extraction.drug_mentions if dm.where == "body"])
+                ae_count = len(result.extraction.ae_events)
+                print(f"         Extracted: {body_drugs} body drugs, {ae_count} AE events")
+                # 显示审计信息
+                if result.audit.triggered_rules:
+                    print(f"         Audit: {', '.join(result.audit.triggered_rules)}")
+                if result.needs_review:
+                    print("         ⚠️ Needs human review")
 
     # Summary
     print("\n" + "=" * 60)
